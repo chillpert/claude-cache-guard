@@ -1,0 +1,11 @@
+{
+  "name": "claude-revive",
+  "owner": { "name": "chillpert" },
+  "plugins": [
+    {
+      "name": "revive",
+      "source": "./",
+      "description": "Cold-cache guard plus /revive: Haiku writes a handoff, the session clears itself, and the held prompt continues in the fresh conversation."
+    }
+  ]
+}
