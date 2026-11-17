@@ -34,7 +34,7 @@ const GUARDED_ORIGINS = new Set(['composer', 'sdk', 'bridge', 'unclassified'])
 
 type Handoff = { path: string; about: string; text: string; writtenAt: number; host: string; resume?: string }
 type LastRequest = { at: number; tokens: number; model: string }
-type Cold = { idleMs: number; ttlS: number; tokens: number; model: string; ttlKnown: boolean }
+type Cold = { idleMs: number; ttlS: number; tokens: number }
 
 let writing = false
 let writtenForConversation: { sessionId: string; path: string } | null = null
@@ -85,7 +85,7 @@ const SYSTEM = `You write handoff notes. A developer is about to clear a Claude 
 
 Reply in exactly this format and nothing else:
 
-ABOUT: <one sentence, at most 25 words, saying what the session was last working on, e.g. "Removing the player-hurt SFX and re-running the Studio audit.">
+ABOUT: <one sentence, at most 25 words, saying what the session was last working on, e.g. "Fixing the flaky login test and re-running the CI suite.">
 
 ## Goal
 ## Decisions taken
@@ -147,16 +147,8 @@ function kTokens(n: number): string {
 
 function warning(c: Cold): string {
   const writeMult = c.ttlS <= SHORTEST_TTL_S ? 1.25 : 2
-  const cold = Math.round(c.tokens * writeMult)
-  const warm = Math.round(c.tokens * 0.1)
   const ratio = Math.round(writeMult / 0.1)
-  const life = c.ttlKnown ? `its cache lasts ${duration(c.ttlS * 1000)}` : `its cache lasts at most 1h`
-  return [
-    `Prompt held back: the prompt cache is cold. This conversation has been idle ${duration(c.idleMs)} and ${life}.`,
-    `Sending now re-writes ~${kTokens(c.tokens)} tokens of context to the cache, billed like ~${kTokens(cold)} input tokens, instead of reading it for ~${kTokens(warm)}: about ${ratio}x a warm turn.`,
-    `Type /revive to carry on in a fresh conversation: Haiku writes a handoff for a few cents and your prompt is sent there automatically.`,
-    `Or send the same message again within 2 minutes to pay for the cold turn here.`,
-  ].join('\n')
+  return `Cache cold (idle ${duration(c.idleMs)}, ~${kTokens(c.tokens)} tokens): sending here costs ~${ratio}x a warm turn. /revive to continue fresh, or resend within 2m to send here anyway.`
 }
 
 // --- reading the transcript (only when this process has no record of the last request) ---------------
@@ -237,10 +229,9 @@ async function coldness($: EngineInterface, sessionId: string): Promise<Cold | n
     ttlS = fromTranscript.ttlS
     if (ttlS) ttlBySession.set(sessionId, ttlS)
   }
-  const ttlKnown = ttlS !== undefined
   const effective = ttlS ?? LONGEST_TTL_S // unknown: assume the long lifetime, so we never block a warm cache
   if (idleMs < effective * 1000) return null
-  return { idleMs, ttlS: effective, tokens: last.tokens, model: last.model, ttlKnown }
+  return { idleMs, ttlS: effective, tokens: last.tokens }
 }
 
 async function remember($: EngineInterface, sessionId: string, record: LastRequest): Promise<void> {
@@ -263,7 +254,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
-      description: 'Hand off to a fresh conversation: Haiku writes the handoff, then /clear runs (no turn of this session)',
+      description: 'Continue in a fresh conversation via a Haiku handoff',
       argumentHint: '[status | simulate-cold]',
     })
     // A hot reload loses module memory; bring back a handoff armed for this desktop session row.
@@ -299,7 +290,15 @@ export const register: Register = on => {
       if (e.agentId === undefined && result.usage) {
         const u = result.usage
         const tokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens
-        await remember($, await $.session.id(), { at: await $.clock.now(), tokens, model: u.model })
+        const sessionId = await $.session.id()
+        await remember($, sessionId, { at: await $.clock.now(), tokens, model: u.model })
+        // The conversation carried on after its handoff was written (the clear never happened): that
+        // handoff is stale, so a later /clear must not arm it.
+        if (pending && writtenForConversation?.sessionId === sessionId) {
+          pending = null
+          writtenForConversation = null
+          await $.store.delete(STORE_KEY).catch(() => {})
+        }
       }
     } catch {
       // recording is best effort
@@ -326,7 +325,7 @@ export const register: Register = on => {
     held = { sessionId, text: e.text, at: now, hadAttachments: Boolean(e.attachments?.length) }
     override = { sessionId, text: e.text, until: now + CONFIRM_MS }
     $.ui.log(warning(cold))
-    return { drop: 'Cold cache: prompt held. Type /revive to continue it in a fresh conversation, or send it again within 2 minutes to send it here anyway.' }
+    return { drop: 'Prompt held: cold cache.' }
   }).catch(($, e, next) => next(e)) // anything unexpected: let the prompt through
 
   // B: /revive.
@@ -338,38 +337,35 @@ export const register: Register = on => {
       const now = await $.clock.now()
       await remember($, sessionId, { at: now - 2 * 60 * 60 * 1000, tokens: 150_000, model: 'simulated' })
       ttlBySession.set(sessionId, LONGEST_TTL_S)
-      return { text: '[script, no model turn] This conversation now counts as cold (simulated). Your next prompt will be held.' }
+      return { text: 'Simulated cold cache. Your next prompt will be held.' }
     }
 
     if (e.args.trim() === 'status') {
       const cold = await coldness($, sessionId)
       const last = lastRequest.get(sessionId) ?? ((await $.store.get(LAST_PREFIX + sessionId)) as LastRequest | undefined)
+      const ttl = ttlBySession.get(sessionId)
       return {
         text: [
-          '[script, no model turn] revive status',
-          `last request: ${last ? `${duration((await $.clock.now()) - last.at)} ago, ~${kTokens(last.tokens)} tokens, ${last.model}` : 'unknown in this process'}`,
-          `cache lifetime: ${ttlBySession.get(sessionId) ?? 'not read yet'}${ttlBySession.has(sessionId) ? 's' : ''}`,
-          `cold: ${cold ? 'yes' : 'no'}`,
-          `held prompt: ${held?.sessionId === sessionId ? clip(held.text, 80) : 'none'}`,
+          last
+            ? `Last request ${duration((await $.clock.now()) - last.at)} ago · ~${kTokens(last.tokens)} tokens · ${last.model}`
+            : 'Last request: unknown',
+          `Cache TTL ${ttl ? duration(ttl * 1000) : '?'} · cold: ${cold ? 'yes' : 'no'} · held: ${held?.sessionId === sessionId ? clip(held.text, 80) : 'none'}`,
         ].join('\n'),
       }
     }
 
-    if (writing) return { text: 'a handoff is already being written. Wait for it.' }
+    if (writing) return { text: 'Handoff already in progress.' }
     if (writtenForConversation?.sessionId === sessionId) {
-      return {
-        text: `the handoff for this conversation is already written (${writtenForConversation.path}). Type /clear if the automatic clear did not happen.`,
-      }
+      return { text: "Already handed off. Run /clear if it didn't clear." }
     }
     const messages = await $.session.messages()
     if (!messages.some(m => m.role === 'user' && m.text.trim())) {
-      return { text: 'nothing to hand off yet.' }
+      return { text: 'Nothing to hand off yet.' }
     }
 
     writing = true
     try {
-      const banner = '⟳ Reviving session (script + Haiku; this session’s model is not called)…'
-      $.ui.log(banner)
+      const banner = '⟳ Reviving…'
       $.ui.status(banner)
       $.ui.toast(banner, { timeoutMs: 8000 })
       const resume = held?.sessionId === sessionId ? held : null
@@ -411,20 +407,18 @@ export const register: Register = on => {
         try {
           await $.command.run({ command: 'clear' })
         } catch {
-          $.ui.log('revive: could not clear automatically. Type /clear and the handoff is still used.')
+          $.ui.log("Couldn't auto-clear. Run /clear to finish.")
         }
       })
-      const resumeLine = resume
-        ? `\nYour held prompt will be sent to the fresh conversation${resume.hadAttachments ? ' (its attachments could not be kept: add them again)' : ''}.`
-        : ''
-      return { text: `[script, no model turn] Handoff written to ${path}\nAbout: ${about}${resumeLine}\nClearing…` }
+      const resumeLine = resume ? ` Your prompt will follow${resume.hadAttachments ? ' (re-add attachments)' : ''}.` : ''
+      return { text: `Handoff saved to .claude/revive/${stamp(now)}.md. Clearing…${resumeLine}` }
     } catch (err) {
-      return { text: `failed: ${err instanceof Error ? err.message : String(err)}. Nothing was cleared.` }
+      return { text: `Revive failed: ${err instanceof Error ? err.message : String(err)}. Nothing cleared.` }
     } finally {
       writing = false
       $.ui.status(undefined)
     }
-  }).catch(() => ({ text: 'failed unexpectedly. Nothing was cleared.' }))
+  }).catch(() => ({ text: 'Revive failed. Nothing cleared.' }))
 
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' && pending) {
@@ -461,13 +455,12 @@ async function hostId($: EngineInterface): Promise<string> {
 }
 
 async function announce($: EngineInterface, h: Handoff): Promise<void> {
-  $.ui.log(`Revived from handoff: ${h.about}`)
-  $.ui.toast(`Revived: ${h.about}`, { timeoutMs: 10000 })
+  $.ui.log(`↻ Revived: ${h.about}`)
   if (h.resume) {
     try {
       await $.prompt.submit({ text: h.resume })
     } catch {
-      $.ui.log('revive: could not send your held prompt automatically. Paste it again:')
+      $.ui.log("Couldn't resend your prompt. Here it is:")
       $.ui.log(h.resume)
     }
   }
@@ -477,7 +470,7 @@ async function announce($: EngineInterface, h: Handoff): Promise<void> {
       "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null",
       "$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)",
       "$x = $t.GetElementsByTagName('text')",
-      "$x.Item(0).AppendChild($t.CreateTextNode('Claude: session revived')) > $null",
+      "$x.Item(0).AppendChild($t.CreateTextNode('Session revived')) > $null",
       "$x.Item(1).AppendChild($t.CreateTextNode($env:REVIVE_ABOUT)) > $null",
       "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($t))",
     ].join('; ')
@@ -485,6 +478,6 @@ async function announce($: EngineInterface, h: Handoff): Promise<void> {
       .run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script], { env: { REVIVE_ABOUT: h.about }, timeoutMs: 15000 })
       .catch(() => {})
   } else {
-    await $.ui.notify(h.about, { title: 'Claude: session revived' }).catch(() => {})
+    await $.ui.notify(h.about, { title: 'Session revived' }).catch(() => {})
   }
 }

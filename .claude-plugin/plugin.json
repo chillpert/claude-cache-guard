@@ -1,8 +1,11 @@
 {
   "name": "revive",
-  "version": "0.2.1",
-  "description": "/revive: writes a handoff with Haiku (never the session's own model), clears the session, and hands the new conversation that handoff.",
+  "version": "0.2.2",
+  "description": "Cold-cache guard plus /revive: Haiku writes a handoff, the session clears itself, and the held prompt continues in the fresh conversation.",
   "author": {
     "name": "chillpert"
-  }
+  },
+  "homepage": "https://github.com/chillpert/claude-revive",
+  "repository": "https://github.com/chillpert/claude-revive",
+  "license": "MIT"
 }
