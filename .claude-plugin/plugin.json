@@ -1,11 +1,12 @@
 {
-  "name": "revive",
-  "version": "0.2.2",
-  "description": "Cold-cache guard plus /revive: Haiku writes a handoff, the session clears itself, and the held prompt continues in the fresh conversation.",
+  "name": "cache-guard",
+  "version": "0.3.0",
+  "description": "Saves prompt-cache cost: holds prompts sent into a cold cache, keeps the cache warm while you step away, shows minutes until it goes cold in a compact bar, and /cache-guard handoff continues in a fresh conversation via a Haiku summary.",
   "author": {
     "name": "chillpert"
   },
-  "homepage": "https://github.com/chillpert/claude-revive",
-  "repository": "https://github.com/chillpert/claude-revive",
-  "license": "MIT"
+  "homepage": "https://github.com/chillpert/claude-cache-guard",
+  "repository": "https://github.com/chillpert/claude-cache-guard",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
 }

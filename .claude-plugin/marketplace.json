@@ -1,11 +1,11 @@
 {
-  "name": "claude-revive",
+  "name": "claude-cache-guard",
   "owner": { "name": "chillpert" },
   "plugins": [
     {
-      "name": "revive",
+      "name": "cache-guard",
       "source": "./",
-      "description": "Cold-cache guard plus /revive: Haiku writes a handoff, the session clears itself, and the held prompt continues in the fresh conversation."
+      "description": "Saves prompt-cache cost: holds prompts sent into a cold cache, keeps the cache warm while you step away, shows minutes until it goes cold in a compact bar, and /cache-guard handoff continues in a fresh conversation via a Haiku summary."
     }
   ]
 }
