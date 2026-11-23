@@ -609,7 +609,8 @@ async function tick($: EngineInterface): Promise<void> {
     if (!isDue || held) return
     // marked busy before the submit, so the next tick cannot send a second poke
     await update($, warm, v => ({ ...v, isBusy: true, pokes: v.pokes + 1 }))
-    await $.prompt.submit({ text: TEXT.poke })
+    // asUser drops the engine's frame; the poke names the plugin itself, without the frame's long explanation
+    await $.prompt.submit({ text: TEXT.poke, asUser: true })
   } catch {
     // a missed poke only costs a cold cache
   }

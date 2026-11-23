@@ -26,7 +26,7 @@ export const TEXT = {
   barOff: 'Bar hidden. /cache-guard bar on shows it again.',
 
   // keep warm
-  poke: 'Cache keep-alive, no action needed. Reply with only: ok',
+  poke: 'The cache-guard plugin sent a message:\nCache keep-alive, no action needed. Reply with only: ok',
   warmOn: (ttl: string, every: string) => `Keep warm on: a short poke ${every} after the last request (${ttl} cache).`,
   warmOnUnknown: 'Keep warm on: the first poke waits until a reply shows how long the cache lasts.',
   warmOff: 'Keep warm off.',
