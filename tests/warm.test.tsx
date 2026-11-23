@@ -43,13 +43,18 @@ async function engine($: Parameters<TestBody>[0], on: On, seed?: Warm) {
   on('session.id', () => ({ value: 'session' }))
   on('session.messages', () => ({ value: [] }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  const ran: string[] = []
+  on('command.run', (_, e) => {
+    ran.push(`${e.command} ${e.args}`)
+    return { text: '' }
+  })
   const sent: string[] = []
   on('prompt.submit', (_, e) => {
     sent.push(e.text)
     return { text: e.text }
   })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  return { clock, sent, warm: () => kept.value as Warm }
+  return { clock, sent, ran, warm: () => kept.value as Warm }
 }
 
 test('the bar is shown by default and its button switches keep warm', async ($, on) => {
@@ -114,4 +119,45 @@ test('/cache-guard handoff reaches the handoff', async ($, on) => {
 
   expect((await $.command.run(run('handoff'))).text).toBe(TEXT.handoffEmpty)
   expect((await $.command.run(run('nonsense'))).text).toBe(TEXT.usage)
+})
+
+test('the timer is green, then yellow, then red, then cold', async ($, on) => {
+  const { clock } = await engine($, on, { ...OFF, lastAt: START, ttlS: 3600 })
+  const color = async () => {
+    const ui = await $.ui.mount(BAND)
+    const found = await ui.find({ type: 'Text', text: /^Cache/ })
+    await ui.unmount()
+    return [found?.text, found?.props.color]
+  }
+
+  expect(await color()).toEqual([TEXT.barColdIn(60), 'success'])
+  await clock.advance(31 * MINUTE)
+  expect(await color()).toEqual([TEXT.barColdIn(29), 'warning'])
+  // a fifth of an hour is 12 minutes: yellow down to it, red below
+  await clock.advance(16 * MINUTE)
+  expect(await color()).toEqual([TEXT.barColdIn(13), 'warning'])
+  await clock.advance(2 * MINUTE)
+  expect(await color()).toEqual([TEXT.barColdIn(11), 'error'])
+  await clock.advance(11 * MINUTE)
+  expect(await color()).toEqual([TEXT.barCold, 'error'])
+})
+
+test('an unknown lifetime shows no countdown and sends no poke', async ($, on) => {
+  const { clock, sent } = await engine($, on, { ...OFF, isOn: true, onAt: START, activeAt: START, lastAt: START, ttlS: 0 })
+
+  await clock.advance(70 * MINUTE)
+  expect(sent).toEqual([])
+  const ui = await $.ui.mount(BAND)
+  expect((await ui.find({ type: 'Text', text: /^Cache/ }))?.text).toBe(TEXT.barUnknown)
+  await ui.unmount()
+})
+
+test('the handoff button runs /cache-guard handoff', async ($, on) => {
+  const { ran } = await engine($, on)
+
+  const ui = await $.ui.mount(BAND)
+  expect((await ui.find({ type: 'Button', key: 'handoff' }))?.text).toBe(TEXT.barHandoff)
+  await ui.press({ key: 'handoff' })
+  expect(ran).toEqual(['cache-guard handoff'])
+  await ui.unmount()
 })

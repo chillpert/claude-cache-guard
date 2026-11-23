@@ -12,11 +12,13 @@ Formerly `revive`.
 
 Send the same message again within 2 minutes to pay for it anyway.
 
-**The bar.** One short line above the prompt, on by default: the minutes until the cache goes cold, and a button that switches keep warm.
+**The bar.** One short line above the prompt, on by default: the minutes until the cache goes cold, a button that switches keep warm, and a Handoff button.
 
-> Cache cold in 41m   keep warm: off
+> Cache cold in 41m   [Keep warm: off]   [Handoff]
 
-`/cache-guard bar off` hides it (remembered across sessions), `/cache-guard bar on` brings it back.
+The countdown is green while more than half the cache's lifetime is left, yellow down to a fifth, and red below that and once cold. `/cache-guard bar off` hides the bar (remembered across sessions), `/cache-guard bar on` brings it back.
+
+**How the cold timer works.** It follows Anthropic's documented cache rules, from what each request reports: a cache entry lives 5 minutes or 1 hour, every request that reads or writes it starts its lifetime again, and that lifetime runs from the *start* of the request (time spent generating counts against it). The lifetime is taken from the request's own `usage` (which lifetime its cache writes got); until a request has reported one, the bar says "Cache lifetime unknown" and keep warm sends no poke. Every request is then checked: if most of its context was read from the cache, the cache was warm. `/cache-guard status` shows how often the timer agreed with that. The timer cannot see a model switch (each model has its own cache) or anything that changes the cached prefix; the first request after one of those writes the cache anew.
 
 **Keep warm.** Off by default; the bar's button or `/cache-guard warm on` turns it on. While it is on, a short prompt ("poke") goes out shortly before the cache would expire (48 minutes after the last request on a 1-hour cache), so you come back to a warm cache. A poke reads the cache at 0.1x instead of letting it lapse. It never pokes a cache that has already gone cold, and it turns itself off after 8 hours without a message from you. Each poke is a short turn in the conversation.
 

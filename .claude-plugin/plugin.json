@@ -1,6 +1,6 @@
 {
   "name": "cache-guard",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Saves prompt-cache cost: holds prompts sent into a cold cache, keeps the cache warm while you step away, shows minutes until it goes cold in a compact bar, and /cache-guard handoff continues in a fresh conversation via a Haiku summary.",
   "author": {
     "name": "chillpert"

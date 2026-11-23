@@ -53,6 +53,19 @@ const warm = atom({ plugin: 'cache-guard', key: 'warm' } as const, {
   pokes: 0,
   isBusy: false,
 } satisfies Warm)
+// how often the cold timer agreed with what the API reported, for /cache-guard status
+const checks = atom({ plugin: 'cache-guard', key: 'checks' } as const, { right: 0, wrong: 0 })
+
+// The lifetime a request's cache writes got: the one that took most of the written tokens (a
+// server tool can add a small 5-minute write after its result into an otherwise 1-hour cache).
+// A request that wrote nothing says nothing: the entry it read keeps the lifetime it was written with.
+export function writtenTtlS(u: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }): number | undefined {
+  const fiveMin = u.ephemeral_5m_input_tokens ?? 0
+  const oneHour = u.ephemeral_1h_input_tokens ?? 0
+  if (fiveMin === 0 && oneHour === 0) return undefined
+  return oneHour >= fiveMin ? LONGEST_TTL_S : SHORTEST_TTL_S
+}
+
 // the bar above the prompt: shown unless the person hid it (kept across sessions under BAR_KEY)
 const bar = atom({ plugin: 'cache-guard', key: 'bar' } as const, true)
 const BAR_KEY = 'bar'
@@ -178,7 +191,7 @@ function warning(c: Cold): string {
 
 // --- reading the transcript (only when this process has no record of the last request) ---------------
 
-async function transcriptAssistantLines($: EngineInterface, path: string): Promise<string[]> {
+async function transcriptLines($: EngineInterface, path: string): Promise<string[]> {
   const os = await $.env.get('OS')
   const argv =
     os === 'Windows_NT'
@@ -187,37 +200,52 @@ async function transcriptAssistantLines($: EngineInterface, path: string): Promi
           '-NoProfile',
           '-NonInteractive',
           '-Command',
-          "Get-Content -LiteralPath $env:CACHE_GUARD_TRANSCRIPT -Tail 1500 -Encoding UTF8 | Where-Object { $_ -match 'type.:.assistant' } | Select-Object -Last 60",
+          "Get-Content -LiteralPath $env:CACHE_GUARD_TRANSCRIPT -Tail 1500 -Encoding UTF8 | Where-Object { $_ -match 'type.:.(assistant|user)' } | Select-Object -Last 200",
         ]
-      : ['sh', '-c', 'tail -n 1500 "$CACHE_GUARD_TRANSCRIPT" | grep "type.:.assistant" | tail -n 60']
+      : ['sh', '-c', 'tail -n 1500 "$CACHE_GUARD_TRANSCRIPT" | grep -E "type.:.(assistant|user)" | tail -n 200']
   const run = await $.process.run(argv, { env: { CACHE_GUARD_TRANSCRIPT: path }, timeoutMs: 15_000 })
   return run.stdout.split(/\r?\n/).filter(line => line.trim())
 }
 
 type Row = { at: number; tokens: number; model: string; ttlS?: number }
 
-function rowOf(line: string): Row | null {
-  let j: any
-  try {
-    j = JSON.parse(line)
-  } catch {
-    return null
+// The transcript stamps an assistant entry when its reply is written, but a cache entry's lifetime runs
+// from the start of the request. That request started right after the last main-thread user entry
+// (the person's message or a tool result) before it, so that entry's time is taken as the start.
+export function rowsOf(lines: readonly string[]): Row[] {
+  const rows: Row[] = []
+  let startedAt: number | undefined
+  for (const line of lines) {
+    let j: any
+    try {
+      j = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (j?.isSidechain || typeof j?.timestamp !== 'string') continue
+    const at = Date.parse(j.timestamp)
+    if (Number.isNaN(at)) continue
+    if (j.type === 'user') {
+      startedAt = at
+      continue
+    }
+    const u = j.type === 'assistant' ? j.message?.usage : undefined
+    if (!u) continue
+    const tokens =
+      (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0)
+    const ttlS = writtenTtlS({
+      ephemeral_5m_input_tokens: u.cache_creation?.ephemeral_5m_input_tokens,
+      ephemeral_1h_input_tokens: u.cache_creation?.ephemeral_1h_input_tokens,
+    })
+    rows.push({ at: startedAt ?? at, tokens, model: String(j.message?.model ?? ''), ttlS })
   }
-  if (j?.type !== 'assistant' || j.isSidechain) return null
-  const u = j.message?.usage
-  if (!u || typeof j.timestamp !== 'string') return null
-  const tokens =
-    (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0)
-  const oneHour = u.cache_creation?.ephemeral_1h_input_tokens ?? 0
-  const fiveMin = u.cache_creation?.ephemeral_5m_input_tokens ?? 0
-  const ttlS = oneHour > 0 ? LONGEST_TTL_S : fiveMin > 0 ? SHORTEST_TTL_S : undefined
-  return { at: Date.parse(j.timestamp), tokens, model: String(j.message?.model ?? ''), ttlS }
+  return rows
 }
 
 async function readTranscript($: EngineInterface, sessionId: string): Promise<{ last?: LastRequest; ttlS?: number }> {
   const path = transcriptPath.get(sessionId)
   if (!path) return {}
-  const rows = (await transcriptAssistantLines($, path)).map(rowOf).filter((r): r is Row => r !== null && !Number.isNaN(r.at))
+  const rows = rowsOf(await transcriptLines($, path))
   const lastRow = rows.at(-1)
   const ttlRow = [...rows].reverse().find(r => r.ttlS !== undefined)
   return {
@@ -307,19 +335,28 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // Every main-thread model request: when it happened and how big the context was.
+  // Every main-thread model request: when it started and how big the context was. A cache entry's
+  // lifetime runs from the START of the request that wrote or read it, so the start is what counts.
   on('turn.step', async function* ($, e, next) {
+    const startedAt = await $.clock.now()
+    const before = e.agentId === undefined ? await read($, warm).catch(() => null) : null
     const result = yield* next(e)
     try {
       if (e.agentId === undefined && result.usage) {
         const u = result.usage
         const tokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens
         const sessionId = await $.session.id()
-        const at = await $.clock.now()
-        await remember($, sessionId, { at, tokens, model: u.model })
-        const ttlS = u.ephemeral_1h_input_tokens ? LONGEST_TTL_S : u.ephemeral_5m_input_tokens ? SHORTEST_TTL_S : undefined
+        await remember($, sessionId, { at: startedAt, tokens, model: u.model })
+        const ttlS = writtenTtlS(u)
         if (ttlS) ttlBySession.set(sessionId, ttlS)
-        await update($, warm, w => ({ ...w, lastAt: at, ttlS: ttlS ?? w.ttlS }))
+        await update($, warm, w => ({ ...w, lastAt: startedAt, ttlS: ttlS ?? w.ttlS }))
+        // Check the cold timer against what the API reported: was the cache warm when this request
+        // started, as the timer said? Mostly read from the cache = warm; mostly written = cold.
+        if (before?.lastAt && before.ttlS) {
+          const saidWarm = startedAt < before.lastAt + before.ttlS * 1000
+          const wasWarm = u.cache_read_input_tokens > u.cache_creation_input_tokens
+          await update($, checks, c => (saidWarm === wasWarm ? { ...c, right: c.right + 1 } : { ...c, wrong: c.wrong + 1 }))
+        }
         // The conversation carried on after its handoff was written (the clear never happened): that
         // handoff is stale, so a later /clear must not arm it.
         if (pending && writtenForConversation?.sessionId === sessionId) {
@@ -397,6 +434,7 @@ export const register: Register = on => {
         last ? TEXT.statusLast(duration((await $.clock.now()) - last.at), kTokens(last.tokens), last.model) : TEXT.statusLastUnknown,
         TEXT.statusCache(ttl ? duration(ttl * 1000) : '?', cold !== null, held?.sessionId === sessionId ? clip(held.text, 80) : TEXT.statusNone),
         TEXT.statusWarm(w.isOn, w.pokes),
+        TEXT.statusChecks((await read($, checks)).right, (await read($, checks)).wrong),
       ].join('\n'),
     }
   })
@@ -506,11 +544,29 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || !(await read($, bar))) return next(e)
     const w = await read($, warm)
+    const state = barState(w, await $.clock.now())
     const { Box, Button, Text } = $.ui.resolve(e)
     return (
-      <Box flexDirection="row" gap={1}>
-        <Text dimColor>{bandText(w, await $.clock.now())}</Text>
-        <Button key="warm" plain label={w.isOn ? TEXT.barWarmOn : TEXT.barWarmOff} onPress={() => void switchWarm($, !w.isOn)} />
+      <Box flexDirection="row" gap={1} alignItems="center">
+        {state.color ? (
+          <Text color={state.color} tabular>
+            {state.text}
+          </Text>
+        ) : (
+          <Text dimColor>{state.text}</Text>
+        )}
+        <Button
+          key="warm"
+          variant={w.isOn ? 'primary' : 'secondary'}
+          label={w.isOn ? TEXT.barWarmOn : TEXT.barWarmOff}
+          onPress={() => void switchWarm($, !w.isOn)}
+        />
+        <Button
+          key="handoff"
+          variant="secondary"
+          label={TEXT.barHandoff}
+          onPress={() => void $.command.run({ command: COMMAND, args: 'handoff' }).catch(() => $.ui.log(TEXT.handoffFailedShort))}
+        />
       </Box>
     )
   })
@@ -525,13 +581,12 @@ export const register: Register = on => {
 
 // --- keep warm -------------------------------------------------------------------------------------------
 
-const lifetimeS = (w: Warm) => w.ttlS || LONGEST_TTL_S // unknown until a request names it: the subscription default
-
 async function switchWarm($: EngineInterface, isOn: boolean): Promise<string> {
   const now = await $.clock.now()
   const w = await update($, warm, v => ({ ...v, isOn, onAt: isOn ? now : 0 }))
   if (!isOn) return TEXT.warmOff
-  const ttl = lifetimeS(w) * 1000
+  if (!w.ttlS) return TEXT.warmOnUnknown
+  const ttl = w.ttlS * 1000
   return TEXT.warmOn(duration(ttl), duration(ttl * POKE_AT))
 }
 
@@ -548,8 +603,9 @@ async function tick($: EngineInterface): Promise<void> {
       $.ui.log(TEXT.warmIdleOff(duration(idleMs)))
       return
     }
-    const ttl = lifetimeS(w) * 1000
-    const isDue = w.lastAt > 0 && !w.isBusy && now >= w.lastAt + ttl * POKE_AT && now < w.lastAt + ttl
+    // no poke while the lifetime is unknown: its timing would be a guess
+    const ttl = w.ttlS * 1000
+    const isDue = w.lastAt > 0 && ttl > 0 && !w.isBusy && now >= w.lastAt + ttl * POKE_AT && now < w.lastAt + ttl
     if (!isDue || held) return
     // marked busy before the submit, so the next tick cannot send a second poke
     await update($, warm, v => ({ ...v, isBusy: true, pokes: v.pokes + 1 }))
@@ -559,13 +615,19 @@ async function tick($: EngineInterface): Promise<void> {
   }
 }
 
-// The cache's own state, whether keep warm is on or not: the button beside it says that.
-function bandText(w: Warm, now: number): string {
-  if (w.isBusy) return TEXT.barBusy
-  if (!w.lastAt) return TEXT.barNoRequest
-  const coldAt = w.lastAt + lifetimeS(w) * 1000
-  if (now >= coldAt) return TEXT.barCold
-  return TEXT.barColdIn(Math.ceil((coldAt - now) / 60_000))
+// The cache's own state, whether keep warm is on or not: the button beside it says that. Green with
+// more than half the lifetime left, yellow down to a fifth, red below that and once cold.
+type BarState = { text: string; color?: 'success' | 'warning' | 'error' }
+
+function barState(w: Warm, now: number): BarState {
+  if (w.isBusy) return { text: TEXT.barBusy, color: 'success' }
+  if (!w.lastAt) return { text: TEXT.barNoRequest }
+  if (!w.ttlS) return { text: TEXT.barUnknown }
+  const ttl = w.ttlS * 1000
+  const left = w.lastAt + ttl - now
+  if (left <= 0) return { text: TEXT.barCold, color: 'error' }
+  const color = left > ttl * 0.5 ? 'success' : left > ttl * 0.2 ? 'warning' : 'error'
+  return { text: TEXT.barColdIn(Math.ceil(left / 60_000)), color }
 }
 
 async function hostId($: EngineInterface): Promise<string> {
