@@ -48,13 +48,18 @@ async function engine($: Parameters<TestBody>[0], on: On, seed?: Warm) {
     ran.push(`${e.command} ${e.args}`)
     return { text: '' }
   })
+  const logged: string[] = []
+  on('ui.log', (_, e) => {
+    logged.push(e.text)
+    return { value: undefined }
+  })
   const sent: string[] = []
   on('prompt.submit', (_, e) => {
     sent.push(e.text)
     return { text: e.text }
   })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  return { clock, sent, ran, warm: () => kept.value as Warm }
+  return { clock, sent, ran, logged, warm: () => kept.value as Warm }
 }
 
 test('the bar is shown by default and its button switches keep warm', async ($, on) => {
@@ -152,12 +157,13 @@ test('an unknown lifetime shows no countdown and sends no poke', async ($, on) =
   await ui.unmount()
 })
 
-test('the handoff button runs /cache-guard handoff', async ($, on) => {
-  const { ran } = await engine($, on)
+test('the handoff button runs the handoff itself', async ($, on) => {
+  const { ran, logged } = await engine($, on)
 
   const ui = await $.ui.mount(BAND)
   expect((await ui.find({ type: 'Button', key: 'handoff' }))?.text).toBe(TEXT.barHandoff)
   await ui.press({ key: 'handoff' })
-  expect(ran).toEqual(['cache-guard handoff'])
+  expect(ran).toEqual([]) // nothing reaches the engine unanswered
+  expect(logged).toEqual([TEXT.handoffEmpty])
   await ui.unmount()
 })

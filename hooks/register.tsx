@@ -440,73 +440,9 @@ export const register: Register = on => {
   })
 
   // B: /cache-guard handoff.
-  on('command.run', { command: COMMAND, args: /^\s*handoff\b/ }, async $ => {
-    const sessionId = await $.session.id()
-
-    if (writing) return { text: TEXT.handoffBusy }
-    if (writtenForConversation?.sessionId === sessionId) {
-      return { text: TEXT.handoffDone }
-    }
-    const messages = await $.session.messages()
-    if (!messages.some(m => m.role === 'user' && m.text.trim())) {
-      return { text: TEXT.handoffEmpty }
-    }
-
-    writing = true
-    try {
-      const banner = TEXT.handoffRunning
-      $.ui.status(banner)
-      $.ui.toast(banner, { timeoutMs: 8000 })
-      const resume = held?.sessionId === sessionId ? held : null
-      const root = await $.session.root()
-      const condensed = condense(messages, resume?.text)
-      const ask = `Working directory: ${root}\n\n<transcript>\n${condensed}\n</transcript>`
-
-      let about = ''
-      let body = ''
-      let note = ''
-      const reply = await $.model.complete({ model: MODEL, system: SYSTEM, prompt: ask, maxTokens: 6000, timeoutMs: 240_000 })
-      if (reply.isAnswered && reply.text.trim()) {
-        ;({ about, body } = parse(reply.text))
-        note = TEXT.handoffSummaryBy(MODEL)
-      } else {
-        const why = reply.isAnswered ? 'empty reply' : `${reply.reason}${'error' in reply ? ` (${reply.error})` : ''}`
-        note = TEXT.handoffSummaryFailed(why)
-        body = `## Condensed transcript (tail)\n\n${condensed.slice(-30_000)}`
-      }
-      if (!about) about = TEXT.fileAboutFallback(lastUserAsk(messages))
-      if (resume) body += `\n\n${TEXT.filePending}\n\n${resume.text}\n`
-
-      const now = await $.clock.now()
-      const dir = `${root.replace(/[\\/]+$/, '')}/.claude/handoffs`
-      const path = `${dir}/${stamp(now)}.md`
-      const text = `${TEXT.fileTitle}\n\n${note}\n\n${TEXT.fileAbout(about)}\n\n${body}\n`
-      if (!(await $.fs.exists(`${dir}/.gitignore`))) await $.fs.write(`${dir}/.gitignore`, '*\n')
-      await $.fs.write(path, text)
-
-      pending = { path, about, text, writtenAt: now, host: await hostId($), resume: resume?.text }
-      writtenForConversation = { sessionId, path }
-      held = null
-      override = null
-      await $.store.set(STORE_KEY, { ...pending, phase: 'pending' })
-
-      // Run /clear once this command has returned and the session is idle. Calling it from inside this
-      // hook would be refused (the command is still running).
-      $.clock.after(300, async () => {
-        try {
-          await $.command.run({ command: 'clear' })
-        } catch {
-          $.ui.log(TEXT.clearFailed)
-        }
-      })
-      return { text: TEXT.handoffSaved(`${stamp(now)}.md`, resume !== null, Boolean(resume?.hadAttachments)) }
-    } catch (err) {
-      return { text: TEXT.handoffFailed(err instanceof Error ? err.message : String(err)) }
-    } finally {
-      writing = false
-      $.ui.status(undefined)
-    }
-  }).catch(() => ({ text: TEXT.handoffFailedShort }))
+  on('command.run', { command: COMMAND, args: /^\s*handoff\b/ }, $ => handoff($)).catch(() => ({
+    text: TEXT.handoffFailedShort,
+  }))
 
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' && pending) {
@@ -565,7 +501,12 @@ export const register: Register = on => {
           key="handoff"
           variant="secondary"
           label={TEXT.barHandoff}
-          onPress={() => void $.command.run({ command: COMMAND, args: 'handoff' }).catch(() => $.ui.log(TEXT.handoffFailedShort))}
+          onPress={() =>
+            void handoff($).then(
+              ({ text }) => $.ui.log(text),
+              () => $.ui.log(TEXT.handoffFailedShort),
+            )
+          }
         />
       </Box>
     )
@@ -580,6 +521,76 @@ export const register: Register = on => {
 }
 
 // --- keep warm -------------------------------------------------------------------------------------------
+
+// B: /cache-guard handoff, typed or from the bar's button. The button calls this directly, as a
+// `$.command.run` from this plugin's own handler skips this plugin's own `command.run` hooks.
+async function handoff($: EngineInterface): Promise<{ text: string }> {
+  const sessionId = await $.session.id()
+
+  if (writing) return { text: TEXT.handoffBusy }
+  if (writtenForConversation?.sessionId === sessionId) {
+    return { text: TEXT.handoffDone }
+  }
+  const messages = await $.session.messages()
+  if (!messages.some(m => m.role === 'user' && m.text.trim())) {
+    return { text: TEXT.handoffEmpty }
+  }
+
+  writing = true
+  try {
+    const banner = TEXT.handoffRunning
+    $.ui.status(banner)
+    $.ui.toast(banner, { timeoutMs: 8000 })
+    const resume = held?.sessionId === sessionId ? held : null
+    const root = await $.session.root()
+    const condensed = condense(messages, resume?.text)
+    const ask = `Working directory: ${root}\n\n<transcript>\n${condensed}\n</transcript>`
+
+    let about = ''
+    let body = ''
+    let note = ''
+    const reply = await $.model.complete({ model: MODEL, system: SYSTEM, prompt: ask, maxTokens: 6000, timeoutMs: 240_000 })
+    if (reply.isAnswered && reply.text.trim()) {
+      ;({ about, body } = parse(reply.text))
+      note = TEXT.handoffSummaryBy(MODEL)
+    } else {
+      const why = reply.isAnswered ? 'empty reply' : `${reply.reason}${'error' in reply ? ` (${reply.error})` : ''}`
+      note = TEXT.handoffSummaryFailed(why)
+      body = `## Condensed transcript (tail)\n\n${condensed.slice(-30_000)}`
+    }
+    if (!about) about = TEXT.fileAboutFallback(lastUserAsk(messages))
+    if (resume) body += `\n\n${TEXT.filePending}\n\n${resume.text}\n`
+
+    const now = await $.clock.now()
+    const dir = `${root.replace(/[\\/]+$/, '')}/.claude/handoffs`
+    const path = `${dir}/${stamp(now)}.md`
+    const text = `${TEXT.fileTitle}\n\n${note}\n\n${TEXT.fileAbout(about)}\n\n${body}\n`
+    if (!(await $.fs.exists(`${dir}/.gitignore`))) await $.fs.write(`${dir}/.gitignore`, '*\n')
+    await $.fs.write(path, text)
+
+    pending = { path, about, text, writtenAt: now, host: await hostId($), resume: resume?.text }
+    writtenForConversation = { sessionId, path }
+    held = null
+    override = null
+    await $.store.set(STORE_KEY, { ...pending, phase: 'pending' })
+
+    // Run /clear once this command has returned and the session is idle. Calling it from inside this
+    // hook would be refused (the command is still running).
+    $.clock.after(300, async () => {
+      try {
+        await $.command.run({ command: 'clear' })
+      } catch {
+        $.ui.log(TEXT.clearFailed)
+      }
+    })
+    return { text: TEXT.handoffSaved(`${stamp(now)}.md`, resume !== null, Boolean(resume?.hadAttachments)) }
+  } catch (err) {
+    return { text: TEXT.handoffFailed(err instanceof Error ? err.message : String(err)) }
+  } finally {
+    writing = false
+    $.ui.status(undefined)
+  }
+}
 
 async function switchWarm($: EngineInterface, isOn: boolean): Promise<string> {
   const now = await $.clock.now()
