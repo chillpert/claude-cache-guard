@@ -20,12 +20,12 @@ The countdown is green while more than half the cache's lifetime is left, yellow
 
 **How the cold timer works.** It follows Anthropic's documented cache rules, from what each request reports: a cache entry lives 5 minutes or 1 hour, every request that reads or writes it starts its lifetime again, and that lifetime runs from the *start* of the request (time spent generating counts against it). The lifetime is taken from the request's own `usage` (which lifetime its cache writes got); until a request has reported one, the bar says "Cache lifetime unknown" and keep warm sends no poke. Every request is then checked: if most of its context was read from the cache, the cache was warm. `/cache-guard status` shows how often the timer agreed with that. The timer cannot see a model switch (each model has its own cache) or anything that changes the cached prefix; the first request after one of those writes the cache anew.
 
-**Keep warm.** Off by default; the bar's button or `/cache-guard warm on` turns it on. While it is on, a short prompt ("poke") goes out shortly before the cache would expire (48 minutes after the last request on a 1-hour cache), so you come back to a warm cache. A poke reads the cache at 0.1x instead of letting it lapse. It never pokes a cache that has already gone cold, and it turns itself off after 8 hours without a message from you. Each poke is a short turn in the conversation.
+**Keep warm.** Off by default; the bar's button or `/cache-guard warm on` turns it on. While it is on, a short prompt ("poke") goes out shortly before the cache would expire (48 minutes after the last request on a 1-hour cache), so you come back to a warm cache. A poke reads the cache at 0.1x instead of letting it lapse. It never pokes a cache that has already gone cold, and it turns itself off after 8 hours without a message from you. Each poke is a short turn in the conversation. Whether it is on is kept for the session row, so it stays on when the desktop app restarts the session's process (the bar disappears while the process is down, and no poke can go out until it is back).
 
 **`/cache-guard handoff`.** Runs in the engine, never as a model turn of the current conversation:
 
 1. Reads the transcript as data, condenses it, and has Haiku write a handoff (goal, decisions, state, files, what is left, next step) to `<project>/.claude/handoffs/<timestamp>.md` (git-ignored).
-2. Runs `/clear` by itself.
+2. Runs `/clear` by itself, 5 seconds later. Until then the bar's **Cancel handoff** button, or `/cache-guard cancel`, stops it: while the summary is being written, or during those 5 seconds. Nothing is cleared and a held prompt stays held.
 3. Gives the fresh conversation the handoff, and sends the prompt the guard held back, so work continues immediately.
 4. Shows "↻ Continued: <one sentence>" and a desktop notification.
 

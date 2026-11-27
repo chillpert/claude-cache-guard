@@ -26,7 +26,7 @@ const BAND = {
 
 // Nothing sits beneath the plugin: these hooks stand for the engine.
 // With a seed, the state is answered from it (and does not redraw); without, the kit's own state does.
-async function engine($: Parameters<TestBody>[0], on: On, seed?: Warm) {
+async function engine($: Parameters<TestBody>[0], on: On, seed?: Warm, messages: unknown[] = []) {
   const clock = mock.clock(on, { now: START })
   mock.store(on)
   mock.env(on, {})
@@ -41,7 +41,11 @@ async function engine($: Parameters<TestBody>[0], on: On, seed?: Warm) {
   }
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.id', () => ({ value: 'session' }))
-  on('session.messages', () => ({ value: [] }))
+  on('session.messages', () => ({ value: messages }) as never)
+  on('session.root', () => ({ value: '/repo' }))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.write', () => ({ value: undefined }))
+  on('model.complete', () => ({ value: { isAnswered: true, text: 'ABOUT: Fixing the login test.\n\n## Goal\nfix it', usage: {} } }) as never)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   const ran: string[] = []
   on('command.run', (_, e) => {
@@ -166,4 +170,39 @@ test('the handoff button runs the handoff itself', async ($, on) => {
   expect(ran).toEqual([]) // nothing reaches the engine unanswered
   expect(logged).toEqual([TEXT.handoffEmpty])
   await ui.unmount()
+})
+
+test('keep warm comes back on after the session process restarts', async ($, on) => {
+  // what an earlier process kept for this session row; this process starts with the default state
+  mock.store(on, { 'warm:session': { isOn: true, onAt: START, activeAt: START, lastAt: START, ttlS: 3600, pokes: 2 } })
+  mock.clock(on, { now: START + 10 * MINUTE })
+  mock.env(on, {})
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('session.id', () => ({ value: 'session' }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount(BAND)
+  expect((await ui.find({ type: 'Button', key: 'warm' }))?.text).toBe(TEXT.barWarmOn)
+  expect((await ui.find({ type: 'Text', text: /^Cache/ }))?.text).toBe(TEXT.barColdIn(50))
+  await ui.unmount()
+})
+
+test('a handoff can be cancelled before its clear', async ($, on) => {
+  const { clock, ran, logged } = await engine($, on, undefined, [{ role: 'user', text: 'fix the login test', toolUses: [] }])
+
+  const ui = await $.ui.mount(BAND)
+  await ui.press({ key: 'handoff' })
+  expect((await ui.find({ type: 'Button', key: 'cancel' }))?.text).toBe(TEXT.barCancel)
+  await ui.press({ key: 'cancel' })
+  expect(logged.at(-1)).toBe(TEXT.handoffCancelled)
+  expect(await ui.find({ type: 'Button', key: 'handoff' })).toBeDefined()
+  await clock.advance(MINUTE)
+  expect(ran).toEqual([]) // no /clear
+  await ui.unmount()
+})
+
+test('/cache-guard cancel with no handoff in flight says so', async ($, on) => {
+  await engine($, on)
+  expect((await $.command.run(run('cancel'))).text).toBe(TEXT.handoffNothingToCancel)
 })

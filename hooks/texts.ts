@@ -1,12 +1,14 @@
 // Every text cache-guard shows a person, in one place. The handoff prompt for Haiku is in register.tsx.
 
 export const COMMAND = 'cache-guard'
+// the grace period between a written handoff and its /clear, in which it can still be cancelled
+export const CLEAR_DELAY_S = 5
 
 export const TEXT = {
   // the slash command in the typeahead
   commandDescription: 'Cache status, handoff to a fresh conversation, keep warm, the bar',
-  commandHint: '[status | handoff | warm on | warm off | bar on | bar off]',
-  usage: 'Use /cache-guard with status, handoff, warm on, warm off, bar on or bar off.',
+  commandHint: '[status | handoff | cancel | warm on | warm off | bar on | bar off]',
+  usage: 'Use /cache-guard with status, handoff, cancel, warm on, warm off, bar on or bar off.',
 
   // the guard, when it holds a prompt back
   cold: (idle: string, tokens: string, ratio: number) =>
@@ -22,6 +24,7 @@ export const TEXT = {
   barWarmOn: 'Keep warm: on',
   barWarmOff: 'Keep warm: off',
   barHandoff: 'Handoff',
+  barCancel: 'Cancel handoff',
   barOn: 'Bar shown above the prompt.',
   barOff: 'Bar hidden. /cache-guard bar on shows it again.',
 
@@ -49,9 +52,11 @@ export const TEXT = {
   handoffEmpty: 'Nothing to hand off yet.',
   handoffRunning: '⟳ Writing handoff…',
   handoffSaved: (file: string, hasPrompt: boolean, hadAttachments: boolean) =>
-    `Handoff saved to .claude/handoffs/${file}. Clearing…${hasPrompt ? ` Your prompt will follow${hadAttachments ? ' (re-add attachments)' : ''}.` : ''}`,
+    `Handoff saved to .claude/handoffs/${file}. Clearing in ${CLEAR_DELAY_S}s (Cancel handoff or /cache-guard cancel stops it).${hasPrompt ? ` Your prompt will follow${hadAttachments ? ' (re-add attachments)' : ''}.` : ''}`,
   handoffFailed: (why: string) => `Handoff failed: ${why}. Nothing cleared.`,
   handoffFailedShort: 'Handoff failed. Nothing cleared.',
+  handoffCancelled: 'Handoff cancelled. Nothing cleared; this conversation goes on.',
+  handoffNothingToCancel: 'No handoff in progress.',
   clearFailed: "Couldn't auto-clear. Run /clear to finish.",
   continued: (about: string) => `↻ Continued: ${about}`,
   resendFailed: "Couldn't resend your prompt. Here it is:",

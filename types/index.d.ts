@@ -11,8 +11,11 @@ export type Warm = {
   isBusy: boolean
 }
 
+// A handoff in flight: the summary being written, or the /clear waiting out its grace period. Either can be cancelled.
+export type HandoffPhase = 'idle' | 'writing' | 'clearing'
+
 declare module 'claude-code' {
   interface PluginState {
-    'cache-guard': { warm: Warm; bar: boolean; checks: { right: number; wrong: number } }
+    'cache-guard': { warm: Warm; bar: boolean; checks: { right: number; wrong: number }; handoff: HandoffPhase }
   }
 }

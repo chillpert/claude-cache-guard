@@ -1,8 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 
-import type { Warm } from '../types'
-import { COMMAND, TEXT } from './texts'
+import type { HandoffPhase, Warm } from '../types'
+import { CLEAR_DELAY_S, COMMAND, TEXT } from './texts'
 
 // cache-guard — three parts.
 //
@@ -25,7 +25,9 @@ import { COMMAND, TEXT } from './texts'
 //    person coming back finds it warm. A poke reads the cache (0.1x) instead of letting it lapse and
 //    paying for the whole write again. It never pokes a cache that has already gone cold, and turns
 //    itself off after a long stretch with no message from the person. A one-line band above the
-//    prompt shows it and turns it on and off.
+//    prompt shows it and turns it on and off. Whether it is on is also kept in $.store under the
+//    desktop session row: the desktop app restarts a session's process (the band goes away while it
+//    is down), and $.state does not outlive the process.
 
 const MODEL = 'haiku'
 const BUDGET_CHARS = 320_000 // ~80k tokens of condensed transcript for Haiku
@@ -43,6 +45,8 @@ const GUARDED_ORIGINS = new Set(['composer', 'sdk', 'bridge', 'unclassified'])
 const POKE_AT = 0.8 // of the cache lifetime after the last request
 const TICK_MS = 15_000
 const DEFAULT_WARM_IDLE_HOURS = 8
+const WARM_PREFIX = 'warm:'
+const POKE_STUCK_MS = 10 * 60 * 1000 // a poke whose turn never completed stops blocking the next
 
 const warm = atom({ plugin: 'cache-guard', key: 'warm' } as const, {
   isOn: false,
@@ -53,6 +57,8 @@ const warm = atom({ plugin: 'cache-guard', key: 'warm' } as const, {
   pokes: 0,
   isBusy: false,
 } satisfies Warm)
+// the handoff in flight, for the bar's Cancel button
+const handoffPhase = atom({ plugin: 'cache-guard', key: 'handoff' } as const, 'idle' as HandoffPhase)
 // how often the cold timer agreed with what the API reported, for /cache-guard status
 const checks = atom({ plugin: 'cache-guard', key: 'checks' } as const, { right: 0, wrong: 0 })
 
@@ -74,7 +80,10 @@ type Handoff = { path: string; about: string; text: string; writtenAt: number; h
 type LastRequest = { at: number; tokens: number; model: string }
 type Cold = { idleMs: number; ttlS: number; tokens: number }
 
-let writing = false
+let stop: AbortController | null = null // aborts the Haiku call of the handoff being written
+let clearTimer: { cancel: () => void } | null = null // the /clear a written handoff waits for
+let heldBeforeHandoff: typeof held = null // given back when a handoff is cancelled
+let pokedAt = 0
 let writtenForConversation: { sessionId: string; path: string } | null = null
 let pending: Handoff | null = null // written, waiting for the /clear
 let armed: Handoff | null = null // handed to the conversation that started after that /clear
@@ -295,9 +304,14 @@ async function remember($: EngineInterface, sessionId: string, record: LastReque
 async function pruneStore($: EngineInterface): Promise<void> {
   const now = await $.clock.now()
   for (const key of await $.store.keys()) {
-    if (!key.startsWith(LAST_PREFIX)) continue
-    const value = (await $.store.get(key)) as LastRequest | undefined
-    if (!value || now - value.at > LAST_KEEP_MS) await $.store.delete(key)
+    if (key.startsWith(LAST_PREFIX)) {
+      const value = (await $.store.get(key)) as LastRequest | undefined
+      if (!value || now - value.at > LAST_KEEP_MS) await $.store.delete(key)
+    } else if (key.startsWith(WARM_PREFIX)) {
+      const value = (await $.store.get(key)) as Partial<KeptWarm> | undefined
+      const at = Math.max(value?.onAt ?? 0, value?.activeAt ?? 0, value?.lastAt ?? 0)
+      if (now - at > LAST_KEEP_MS) await $.store.delete(key)
+    }
   }
 }
 
@@ -308,6 +322,9 @@ export const register: Register = on => {
     await $.command.register({ name: COMMAND, description: TEXT.commandDescription, argumentHint: TEXT.commandHint })
     const isBarShown = await $.store.get(BAR_KEY).catch(() => undefined)
     await update($, bar, () => isBarShown !== false)
+    await restoreWarm($).catch(() => {})
+    // a reload loses the timers of a handoff in flight: nothing is left to cancel
+    if (!clearTimer && !stop) await update($, handoffPhase, () => 'idle' as HandoffPhase).catch(() => {})
     $.clock.every(TICK_MS, () => void tick($))
     // A hot reload loses module memory; bring back a handoff armed for this desktop session row.
     try {
@@ -349,7 +366,7 @@ export const register: Register = on => {
         await remember($, sessionId, { at: startedAt, tokens, model: u.model })
         const ttlS = writtenTtlS(u)
         if (ttlS) ttlBySession.set(sessionId, ttlS)
-        await update($, warm, w => ({ ...w, lastAt: startedAt, ttlS: ttlS ?? w.ttlS }))
+        await setWarm($, w => ({ ...w, lastAt: startedAt, ttlS: ttlS ?? w.ttlS }))
         // Check the cold timer against what the API reported: was the cache warm when this request
         // started, as the timer said? Mostly read from the cache = warm; mostly written = cold.
         if (before?.lastAt && before.ttlS) {
@@ -379,7 +396,7 @@ export const register: Register = on => {
 
     const sessionId = await $.session.id()
     const now = await $.clock.now()
-    await update($, warm, w => ({ ...w, activeAt: now }))
+    await setWarm($, w => ({ ...w, activeAt: now }))
     if (override && override.sessionId === sessionId && override.text === e.text && now < override.until) {
       override = null
       held = null
@@ -400,6 +417,7 @@ export const register: Register = on => {
     const args = e.args.trim().split(/\s+/)
 
     if (args[0] === 'handoff') return next(e)
+    if (args[0] === 'cancel') return { text: await cancelHandoff($) }
 
     if (args[0] === 'warm') {
       if (args[1] === 'on') return { text: await switchWarm($, true) }
@@ -459,7 +477,7 @@ export const register: Register = on => {
       await $.store.delete(STORE_KEY).catch(() => {})
     }
     if (e.reason === 'clear') {
-      await update($, warm, w => ({ ...w, lastAt: 0 })).catch(() => {})
+      await setWarm($, w => ({ ...w, lastAt: 0 })).catch(() => {})
       lastRequest.delete(e.sessionId)
       await $.store.delete(LAST_PREFIX + e.sessionId).catch(() => {})
       if (held?.sessionId === e.sessionId) held = null // a plain /clear drops a held prompt
@@ -473,6 +491,7 @@ export const register: Register = on => {
     return next(e)
   })
   on('turn.complete', async ($, e, next) => {
+    pokedAt = 0
     await update($, warm, w => ({ ...w, isBusy: false })).catch(() => {})
     return next(e)
   })
@@ -480,6 +499,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || !(await read($, bar))) return next(e)
     const w = await read($, warm)
+    const phase = await read($, handoffPhase)
     const state = barState(w, await $.clock.now())
     const { Box, Button, Text } = $.ui.resolve(e)
     return (
@@ -497,17 +517,21 @@ export const register: Register = on => {
           label={w.isOn ? TEXT.barWarmOn : TEXT.barWarmOff}
           onPress={() => void switchWarm($, !w.isOn)}
         />
-        <Button
-          key="handoff"
-          variant="secondary"
-          label={TEXT.barHandoff}
-          onPress={() =>
-            void handoff($).then(
-              ({ text }) => $.ui.log(text),
-              () => $.ui.log(TEXT.handoffFailedShort),
-            )
-          }
-        />
+        {phase === 'idle' ? (
+          <Button
+            key="handoff"
+            variant="secondary"
+            label={TEXT.barHandoff}
+            onPress={() =>
+              void handoff($).then(
+                ({ text }) => text && $.ui.log(text),
+                () => $.ui.log(TEXT.handoffFailedShort),
+              )
+            }
+          />
+        ) : (
+          <Button key="cancel" variant="secondary" label={TEXT.barCancel} onPress={() => void cancelHandoff($).then(text => $.ui.log(text))} />
+        )}
       </Box>
     )
   })
@@ -527,7 +551,7 @@ export const register: Register = on => {
 async function handoff($: EngineInterface): Promise<{ text: string }> {
   const sessionId = await $.session.id()
 
-  if (writing) return { text: TEXT.handoffBusy }
+  if ((await read($, handoffPhase)) !== 'idle') return { text: TEXT.handoffBusy }
   if (writtenForConversation?.sessionId === sessionId) {
     return { text: TEXT.handoffDone }
   }
@@ -536,7 +560,10 @@ async function handoff($: EngineInterface): Promise<{ text: string }> {
     return { text: TEXT.handoffEmpty }
   }
 
-  writing = true
+  const myStop = new AbortController()
+  stop = myStop
+  await update($, handoffPhase, () => 'writing' as HandoffPhase)
+  let isClearing = false
   try {
     const banner = TEXT.handoffRunning
     $.ui.status(banner)
@@ -549,7 +576,11 @@ async function handoff($: EngineInterface): Promise<{ text: string }> {
     let about = ''
     let body = ''
     let note = ''
-    const reply = await $.model.complete({ model: MODEL, system: SYSTEM, prompt: ask, maxTokens: 6000, timeoutMs: 240_000 })
+    const reply = await $.model.complete(
+      { model: MODEL, system: SYSTEM, prompt: ask, maxTokens: 6000, timeoutMs: 240_000 },
+      { signal: myStop.signal },
+    )
+    if (myStop.signal.aborted) return { text: '' } // cancelHandoff says so
     if (reply.isAnswered && reply.text.trim()) {
       ;({ about, body } = parse(reply.text))
       note = TEXT.handoffSummaryBy(MODEL)
@@ -567,34 +598,87 @@ async function handoff($: EngineInterface): Promise<{ text: string }> {
     const text = `${TEXT.fileTitle}\n\n${note}\n\n${TEXT.fileAbout(about)}\n\n${body}\n`
     if (!(await $.fs.exists(`${dir}/.gitignore`))) await $.fs.write(`${dir}/.gitignore`, '*\n')
     await $.fs.write(path, text)
+    if (myStop.signal.aborted) return { text: '' } // cancelHandoff says so
 
     pending = { path, about, text, writtenAt: now, host: await hostId($), resume: resume?.text }
     writtenForConversation = { sessionId, path }
+    heldBeforeHandoff = held
     held = null
     override = null
     await $.store.set(STORE_KEY, { ...pending, phase: 'pending' })
 
-    // Run /clear once this command has returned and the session is idle. Calling it from inside this
-    // hook would be refused (the command is still running).
-    $.clock.after(300, async () => {
-      try {
-        await $.command.run({ command: 'clear' })
-      } catch {
-        $.ui.log(TEXT.clearFailed)
-      }
+    // Run /clear after a short grace period, in which Cancel handoff still stops it. Calling it from
+    // inside this hook would be refused anyway (the command is still running).
+    isClearing = true
+    await update($, handoffPhase, () => 'clearing' as HandoffPhase)
+    clearTimer = $.clock.after(CLEAR_DELAY_S * 1000, () => {
+      clearTimer = null
+      stop = null
+      heldBeforeHandoff = null
+      void update($, handoffPhase, () => 'idle' as HandoffPhase).catch(() => {})
+      void $.command.run({ command: 'clear' }).catch(() => $.ui.log(TEXT.clearFailed))
     })
     return { text: TEXT.handoffSaved(`${stamp(now)}.md`, resume !== null, Boolean(resume?.hadAttachments)) }
   } catch (err) {
     return { text: TEXT.handoffFailed(err instanceof Error ? err.message : String(err)) }
   } finally {
-    writing = false
+    if (!isClearing) {
+      if (stop === myStop) stop = null
+      await update($, handoffPhase, () => 'idle' as HandoffPhase).catch(() => {})
+    }
     $.ui.status(undefined)
   }
 }
 
+// Stops a handoff before its /clear: the Haiku call while it is written, or the clear while it waits.
+// The conversation goes on as if nothing happened; a prompt the guard held is held again.
+async function cancelHandoff($: EngineInterface): Promise<string> {
+  const phase = await read($, handoffPhase)
+  if (phase === 'idle') return TEXT.handoffNothingToCancel
+  stop?.abort()
+  stop = null
+  if (phase === 'clearing') {
+    clearTimer?.cancel()
+    clearTimer = null
+    pending = null
+    writtenForConversation = null
+    held = heldBeforeHandoff
+    heldBeforeHandoff = null
+    if (held) override = { sessionId: held.sessionId, text: held.text, until: (await $.clock.now()) + CONFIRM_MS }
+    await $.store.delete(STORE_KEY).catch(() => {})
+  }
+  await update($, handoffPhase, () => 'idle' as HandoffPhase)
+  $.ui.status(undefined)
+  return TEXT.handoffCancelled
+}
+
+// Keep warm as kept in $.store, under the desktop session row (else the session id): $.state is the
+// process's, and the desktop app restarts a session's process while the person is away.
+type KeptWarm = Omit<Warm, 'isBusy'>
+
+async function warmKey($: EngineInterface): Promise<string> {
+  return WARM_PREFIX + ((await $.env.get('CLAUDE_CODE_HOST_SESSION_ID')) ?? (await $.session.id()))
+}
+
+async function setWarm($: EngineInterface, fn: (w: Warm) => Warm): Promise<Warm> {
+  const w = await update($, warm, fn)
+  const { isBusy: _, ...kept } = w
+  await $.store.set(await warmKey($), kept satisfies KeptWarm).catch(() => {})
+  return w
+}
+
+// A fresh process starts with keep warm off and no request seen: take back what the last one kept.
+async function restoreWarm($: EngineInterface): Promise<void> {
+  const w = await read($, warm)
+  if (w.isOn || w.lastAt) return
+  const kept = (await $.store.get(await warmKey($))) as Partial<KeptWarm> | undefined
+  if (!kept) return
+  await update($, warm, v => ({ ...v, ...kept, isBusy: false }))
+}
+
 async function switchWarm($: EngineInterface, isOn: boolean): Promise<string> {
   const now = await $.clock.now()
-  const w = await update($, warm, v => ({ ...v, isOn, onAt: isOn ? now : 0 }))
+  const w = await setWarm($, v => ({ ...v, isOn, onAt: isOn ? now : 0 }))
   if (!isOn) return TEXT.warmOff
   if (!w.ttlS) return TEXT.warmOnUnknown
   const ttl = w.ttlS * 1000
@@ -610,18 +694,28 @@ async function tick($: EngineInterface): Promise<void> {
     const idleHours = (await numberEnv($, $.env.get('CACHE_GUARD_WARM_IDLE_HOURS'))) ?? DEFAULT_WARM_IDLE_HOURS
     const idleMs = idleHours * 60 * 60 * 1000
     if (now - Math.max(w.activeAt, w.onAt) > idleMs) {
-      await update($, warm, v => ({ ...v, isOn: false, onAt: 0 }))
+      await setWarm($, v => ({ ...v, isOn: false, onAt: 0 }))
       $.ui.log(TEXT.warmIdleOff(duration(idleMs)))
       return
     }
     // no poke while the lifetime is unknown: its timing would be a guess
     const ttl = w.ttlS * 1000
+    if (w.isBusy && pokedAt && now - pokedAt > POKE_STUCK_MS) {
+      // the poke's turn never completed (a dialog, a closed prompt): stop it blocking the next
+      pokedAt = 0
+      await update($, warm, v => ({ ...v, isBusy: false }))
+      return
+    }
     const isDue = w.lastAt > 0 && ttl > 0 && !w.isBusy && now >= w.lastAt + ttl * POKE_AT && now < w.lastAt + ttl
-    if (!isDue || held) return
+    if (!isDue || held || (await read($, handoffPhase)) !== 'idle') return
     // marked busy before the submit, so the next tick cannot send a second poke
-    await update($, warm, v => ({ ...v, isBusy: true, pokes: v.pokes + 1 }))
+    pokedAt = now
+    await setWarm($, v => ({ ...v, isBusy: true, pokes: v.pokes + 1 }))
     // asUser drops the engine's frame; the poke names the plugin itself, without the frame's long explanation
-    await $.prompt.submit({ text: TEXT.poke, asUser: true })
+    void $.prompt.submit({ text: TEXT.poke, asUser: true }).catch(() => {
+      pokedAt = 0
+      void update($, warm, v => ({ ...v, isBusy: false })).catch(() => {})
+    })
   } catch {
     // a missed poke only costs a cold cache
   }
