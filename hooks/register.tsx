@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionMessage } from 'claude-code'
 
 import type { HandoffPhase, Warm } from '../types'
+import { missRatio, missUsd, pokeCap, usd } from './prices'
 import { CLEAR_DELAY_S, COMMAND, TEXT } from './texts'
 
 // cache-guard — three parts.
@@ -55,7 +56,11 @@ const warm = atom({ plugin: 'cache-guard', key: 'warm' } as const, {
   lastAt: 0,
   ttlS: 0,
   pokes: 0,
+  streak: 0,
   isBusy: false,
+  tokens: 0,
+  model: '',
+  percent: 0,
 } satisfies Warm)
 // the handoff in flight, for the bar's Cancel button
 const handoffPhase = atom({ plugin: 'cache-guard', key: 'handoff' } as const, 'idle' as HandoffPhase)
@@ -77,13 +82,17 @@ const bar = atom({ plugin: 'cache-guard', key: 'bar' } as const, true)
 const BAR_KEY = 'bar'
 
 type Handoff = { path: string; about: string; text: string; writtenAt: number; host: string; resume?: string }
-type LastRequest = { at: number; tokens: number; model: string }
-type Cold = { idleMs: number; ttlS: number; tokens: number }
+// `shown` is the model as $.session.model() named it when the request went out, to tell a later switch.
+type LastRequest = { at: number; tokens: number; model: string; shown?: string; effort?: string }
+type Cold = { idleMs: number; ttlS: number; tokens: number; model: string }
+const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+const EFFORT_KEEPS_PREFIX = 'effortKeeps:' // per model: whether an effort change was seen to keep the cache
 
 let stop: AbortController | null = null // aborts the Haiku call of the handoff being written
 let clearTimer: { cancel: () => void } | null = null // the /clear a written handoff waits for
 let heldBeforeHandoff: typeof held = null // given back when a handoff is cancelled
 let pokedAt = 0
+let effortTo: string | null = null // set by /effort <level>, until the next request goes out
 let writtenForConversation: { sessionId: string; path: string } | null = null
 let pending: Handoff | null = null // written, waiting for the /clear
 let armed: Handoff | null = null // handed to the conversation that started after that /clear
@@ -192,10 +201,13 @@ function kTokens(n: number): string {
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
 }
 
+function costNote(tokens: number, model: string, ttlS: number): string {
+  const dollars = missUsd(tokens, model, ttlS)
+  return dollars === undefined ? '' : TEXT.costNote(usd(dollars))
+}
+
 function warning(c: Cold): string {
-  const writeMult = c.ttlS <= SHORTEST_TTL_S ? 1.25 : 2
-  const ratio = Math.round(writeMult / 0.1)
-  return TEXT.cold(duration(c.idleMs), kTokens(c.tokens), ratio)
+  return TEXT.cold(duration(c.idleMs), kTokens(c.tokens), Math.round(missRatio(c.model, c.ttlS)), costNote(c.tokens, c.model, c.ttlS))
 }
 
 // --- reading the transcript (only when this process has no record of the last request) ---------------
@@ -293,7 +305,27 @@ async function coldness($: EngineInterface, sessionId: string): Promise<Cold | n
   }
   const effective = ttlS ?? LONGEST_TTL_S // unknown: assume the long lifetime, so we never block a warm cache
   if (idleMs < effective * 1000) return null
-  return { idleMs, ttlS: effective, tokens: last.tokens }
+  return { idleMs, ttlS: effective, tokens: last.tokens, model: last.model }
+}
+
+// A cache entry is per model, and an effort level set for the whole request is part of what is
+// cached: changing either since the last request makes the next one write the context again, warm
+// or not. Says which changed, with what switches back, or null. An effort change on a model where
+// one was seen to keep the cache (the level then rides its own message) does not count.
+async function settingsChange($: EngineInterface, sessionId: string): Promise<string | null> {
+  const last = lastRequest.get(sessionId) ?? ((await $.store.get(LAST_PREFIX + sessionId)) as LastRequest | undefined)
+  if (!last) return null
+  const minTokens = (await numberEnv($, $.env.get('CACHE_GUARD_MIN_TOKENS'))) ?? DEFAULT_MIN_TOKENS
+  if (last.tokens < minTokens) return null
+  const ttlS = ttlBySession.get(sessionId) ?? LONGEST_TTL_S
+  const cost = costNote(last.tokens, last.model, ttlS)
+  const shown = await $.session.model().catch(() => undefined)
+  if (last.shown && shown && shown !== last.shown) return TEXT.modelChanged(last.model, kTokens(last.tokens), cost)
+  if (effortTo && last.effort && effortTo !== last.effort) {
+    const keeps = await $.store.get(EFFORT_KEEPS_PREFIX + last.model).catch(() => undefined)
+    if (keeps !== true) return TEXT.effortChanged(last.effort, effortTo, kTokens(last.tokens), cost)
+  }
+  return null
 }
 
 async function remember($: EngineInterface, sessionId: string, record: LastRequest): Promise<void> {
@@ -356,23 +388,32 @@ export const register: Register = on => {
   // lifetime runs from the START of the request that wrote or read it, so the start is what counts.
   on('turn.step', async function* ($, e, next) {
     const startedAt = await $.clock.now()
-    const before = e.agentId === undefined ? await read($, warm).catch(() => null) : null
+    const isMain = e.agentId === undefined
+    const before = isMain ? await read($, warm).catch(() => null) : null
+    const shown = isMain ? await $.session.model().catch(() => undefined) : undefined
     const result = yield* next(e)
     try {
       if (e.agentId === undefined && result.usage) {
         const u = result.usage
         const tokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens
         const sessionId = await $.session.id()
-        await remember($, sessionId, { at: startedAt, tokens, model: u.model })
+        const effort = typeof e.effort === 'string' ? e.effort : undefined
+        const previous = lastRequest.get(sessionId)
+        await remember($, sessionId, { at: startedAt, tokens, model: u.model, shown, effort })
+        effortTo = null
         const ttlS = writtenTtlS(u)
         if (ttlS) ttlBySession.set(sessionId, ttlS)
-        await setWarm($, w => ({ ...w, lastAt: startedAt, ttlS: ttlS ?? w.ttlS }))
+        await setWarm($, w => ({ ...w, lastAt: startedAt, ttlS: ttlS ?? w.ttlS, tokens, model: u.model }))
         // Check the cold timer against what the API reported: was the cache warm when this request
         // started, as the timer said? Mostly read from the cache = warm; mostly written = cold.
         if (before?.lastAt && before.ttlS) {
           const saidWarm = startedAt < before.lastAt + before.ttlS * 1000
           const wasWarm = u.cache_read_input_tokens > u.cache_creation_input_tokens
           await update($, checks, c => (saidWarm === wasWarm ? { ...c, right: c.right + 1 } : { ...c, wrong: c.wrong + 1 }))
+          // An effort change on the same model while the cache was warm: learn whether it kept the cache.
+          if (saidWarm && previous?.effort && effort && previous.effort !== effort && previous.model === u.model) {
+            await $.store.set(EFFORT_KEEPS_PREFIX + u.model, wasWarm).catch(() => {})
+          }
         }
         // The conversation carried on after its handoff was written (the clear never happened): that
         // handoff is stale, so a later /clear must not arm it.
@@ -388,7 +429,22 @@ export const register: Register = on => {
     return result
   })
 
-  // A: hold a prompt that would be sent into a cold cache.
+  // /effort <level>: the level the next request will carry. The picker (no level) is not seen.
+  on('command.run', { command: 'effort' }, async ($, e, next) => {
+    const result = await next(e)
+    const level = e.args.trim().toLowerCase()
+    if (EFFORTS.has(level)) effortTo = level
+    return result
+  }).catch(($, e, next) => next(e))
+
+  // The share of the context window the conversation fills, for the bar.
+  on('session.measure', async ($, e, next) => {
+    const percent = e.context.percent
+    if (percent !== undefined) await update($, warm, w => (w.percent === percent ? w : { ...w, percent })).catch(() => {})
+    return next(e)
+  })
+
+  // A: hold a prompt that would be sent into a cold cache, or right after a model or effort change.
   on('prompt.submit', async ($, e, next) => {
     if (e.command || e.isMeta || e.turnId !== undefined) return next(e)
     if (!GUARDED_ORIGINS.has(e.origin.kind)) return next(e)
@@ -396,19 +452,20 @@ export const register: Register = on => {
 
     const sessionId = await $.session.id()
     const now = await $.clock.now()
-    await setWarm($, w => ({ ...w, activeAt: now }))
+    await setWarm($, w => ({ ...w, activeAt: now, streak: 0 }))
     if (override && override.sessionId === sessionId && override.text === e.text && now < override.until) {
       override = null
       held = null
       return next(e) // the person chose to pay for it
     }
     const cold = await coldness($, sessionId)
-    if (!cold) return next(e)
+    const changed = cold ? null : await settingsChange($, sessionId)
+    if (!cold && !changed) return next(e)
 
     held = { sessionId, text: e.text, at: now, hadAttachments: Boolean(e.attachments?.length) }
     override = { sessionId, text: e.text, until: now + CONFIRM_MS }
-    $.ui.log(warning(cold))
-    return { drop: TEXT.heldDrop }
+    $.ui.log(cold ? warning(cold) : (changed ?? ''))
+    return { drop: cold ? TEXT.heldDrop : TEXT.heldDropSettings }
   }).catch(($, e, next) => next(e)) // anything unexpected: let the prompt through
 
   // /cache-guard: status, keep warm, the bar, and the test aid. `handoff` passes to the hook beneath.
@@ -500,7 +557,11 @@ export const register: Register = on => {
     if (e.props.hasSurvey || !(await read($, bar))) return next(e)
     const w = await read($, warm)
     const phase = await read($, handoffPhase)
-    const state = barState(w, await $.clock.now())
+    const now = await $.clock.now()
+    const state = barState(w, now)
+    const size = sizeState(w)
+    const isCostShown = (await $.env.get('CACHE_GUARD_SHOW_COST')) !== '0'
+    const miss = isCostShown ? missState(w, now) : undefined
     const { Box, Button, Text } = $.ui.resolve(e)
     return (
       <Box flexDirection="row" gap={1} alignItems="center">
@@ -511,6 +572,22 @@ export const register: Register = on => {
         ) : (
           <Text dimColor>{state.text}</Text>
         )}
+        {size ? (
+          <Text key="size" color={size.color} tabular>
+            {size.text}
+          </Text>
+        ) : null}
+        {miss ? (
+          miss.color ? (
+            <Text key="miss" color={miss.color} tabular>
+              {miss.text}
+            </Text>
+          ) : (
+            <Text key="miss" dimColor tabular>
+              {miss.text}
+            </Text>
+          )
+        ) : null}
         <Button
           key="warm"
           variant={w.isOn ? 'primary' : 'secondary'}
@@ -708,9 +785,20 @@ async function tick($: EngineInterface): Promise<void> {
     }
     const isDue = w.lastAt > 0 && ttl > 0 && !w.isBusy && now >= w.lastAt + ttl * POKE_AT && now < w.lastAt + ttl
     if (!isDue || held || (await read($, handoffPhase)) !== 'idle') return
+    // Each poke reads the whole context: past one cache write's worth, letting it lapse is cheaper.
+    // Paused until the person sends a message.
+    const cap = pokeCap(w.model ?? '', w.ttlS)
+    const streak = w.streak ?? 0
+    if (streak >= cap) {
+      if (streak === cap) {
+        await setWarm($, v => ({ ...v, streak: cap + 1 }))
+        $.ui.log(TEXT.warmCapped(cap))
+      }
+      return
+    }
     // marked busy before the submit, so the next tick cannot send a second poke
     pokedAt = now
-    await setWarm($, v => ({ ...v, isBusy: true, pokes: v.pokes + 1 }))
+    await setWarm($, v => ({ ...v, isBusy: true, pokes: v.pokes + 1, streak: (v.streak ?? 0) + 1 }))
     // asUser drops the engine's frame; the poke names the plugin itself, without the frame's long explanation
     void $.prompt.submit({ text: TEXT.poke, asUser: true }).catch(() => {
       pokedAt = 0
@@ -734,6 +822,25 @@ function barState(w: Warm, now: number): BarState {
   if (left <= 0) return { text: TEXT.barCold, color: 'error' }
   const color = left > ttl * 0.5 ? 'success' : left > ttl * 0.2 ? 'warning' : 'error'
   return { text: TEXT.barColdIn(Math.ceil(left / 60_000)), color }
+}
+
+// The context the next message re-sends, and the share of the window it fills: green below 60%,
+// yellow below 80%, red above. The cut-offs are display choices.
+function sizeState(w: Warm): BarState | undefined {
+  if (!w.tokens) return undefined
+  const percent = w.percent ?? 0
+  if (!percent) return { text: TEXT.barTokens(kTokens(w.tokens)) }
+  const color = percent < 60 ? 'success' : percent < 80 ? 'warning' : 'error'
+  return { text: TEXT.barTokensShare(kTokens(w.tokens), Math.round(percent)), color }
+}
+
+// What the next message costs if the cache has expired: yellow once it has.
+function missState(w: Warm, now: number): BarState | undefined {
+  if (!w.tokens || !w.model || !w.ttlS) return undefined
+  const dollars = missUsd(w.tokens, w.model, w.ttlS)
+  if (dollars === undefined) return undefined
+  const isCold = !w.isBusy && w.lastAt > 0 && now >= w.lastAt + w.ttlS * 1000
+  return { text: TEXT.barMiss(usd(dollars)), color: isCold ? 'warning' : undefined }
 }
 
 async function hostId($: EngineInterface): Promise<string> {

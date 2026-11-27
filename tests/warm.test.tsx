@@ -8,7 +8,7 @@ type On = Parameters<TestBody>[1]
 
 const MINUTE = 60_000
 const START = 1_000_000_000
-const OFF: Warm = { isOn: false, onAt: 0, activeAt: 0, lastAt: 0, ttlS: 0, pokes: 0, isBusy: false }
+const OFF: Warm = { isOn: false, onAt: 0, activeAt: 0, lastAt: 0, ttlS: 0, pokes: 0, streak: 0, isBusy: false, tokens: 0, model: '', percent: 0 }
 const BAND = {
   plugin: 'cache-guard',
   surface: 'desktop',
@@ -205,4 +205,30 @@ test('a handoff can be cancelled before its clear', async ($, on) => {
 test('/cache-guard cancel with no handoff in flight says so', async ($, on) => {
   await engine($, on)
   expect((await $.command.run(run('cancel'))).text).toBe(TEXT.handoffNothingToCancel)
+})
+
+test('keep warm pauses once its pokes since the last message add up to one cache write', async ($, on) => {
+  // no price known: a 5-minute cache write is 12.5 reads, so 12 pokes
+  const { clock, sent, logged } = await engine($, on, { ...OFF, isOn: true, onAt: START, activeAt: START, lastAt: START, ttlS: 300, streak: 12 })
+
+  await clock.advance(4 * MINUTE + 30_000)
+  expect(sent).toEqual([])
+  expect(logged).toEqual([TEXT.warmCapped(12)])
+})
+
+test('below the cap the poke still goes out', async ($, on) => {
+  const { clock, sent } = await engine($, on, { ...OFF, isOn: true, onAt: START, activeAt: START, lastAt: START, ttlS: 300, streak: 11 })
+
+  await clock.advance(4 * MINUTE + 30_000)
+  expect(sent).toEqual([TEXT.poke])
+})
+
+test('the bar shows the context size, its share and the miss cost', async ($, on) => {
+  await engine($, on, { ...OFF, lastAt: START, ttlS: 3600, tokens: 310_000, model: 'claude-opus-5-5', percent: 31 })
+
+  const ui = await $.ui.mount(BAND)
+  expect((await ui.find({ type: 'Text', text: /tokens/ }))?.text).toBe(TEXT.barTokensShare('310k', 31))
+  // 310k tokens written at 2x $4 per million
+  expect((await ui.find({ type: 'Text', text: /^miss/ }))?.text).toBe(TEXT.barMiss('$2.48'))
+  await ui.unmount()
 })

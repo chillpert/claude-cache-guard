@@ -11,9 +11,17 @@ export const TEXT = {
   usage: 'Use /cache-guard with status, handoff, cancel, warm on, warm off, bar on or bar off.',
 
   // the guard, when it holds a prompt back
-  cold: (idle: string, tokens: string, ratio: number) =>
-    `Cache cold (idle ${idle}, ~${tokens} tokens): sending here costs ~${ratio}x a warm turn. /cache-guard handoff to continue fresh, or resend within 2m to send here anyway.`,
+  cold: (idle: string, tokens: string, ratio: number, cost: string) =>
+    `Cache cold (idle ${idle}, ~${tokens} tokens${cost}): sending here costs ~${ratio}x a warm turn. /cache-guard handoff to continue fresh, or resend within 2m to send here anyway.`,
   heldDrop: 'Prompt held: cold cache.',
+  // the guard, when the model or the effort changed since the last request
+  modelChanged: (from: string, tokens: string, cost: string) =>
+    `Model changed since the last request: caches are per model, so this message writes the whole context again (~${tokens} tokens${cost}). /model ${from} switches back at no cost, or resend within 2m to send anyway.`,
+  effortChanged: (from: string, to: string, tokens: string, cost: string) =>
+    `Effort changed from ${from} to ${to} since the last request: that likely writes the cached conversation again (~${tokens} tokens${cost}). /effort ${from} switches back at no cost, or resend within 2m to send anyway.`,
+  heldDropSettings: 'Prompt held: model or effort changed.',
+  // what a cache write of the context costs at list price, inside the warnings
+  costNote: (dollars: string) => `, ~${dollars} at list price`,
 
   // the bar above the prompt: the cache's state, a button that switches keep warm, and one for handoff
   barColdIn: (minutes: number) => `Cache cold in ${minutes}m`,
@@ -21,6 +29,9 @@ export const TEXT = {
   barNoRequest: 'Cache empty',
   barUnknown: 'Cache lifetime unknown',
   barCold: 'Cache cold',
+  barTokens: (tokens: string) => `${tokens} tokens`,
+  barTokensShare: (tokens: string, percent: number) => `${tokens} tokens (${percent}%)`,
+  barMiss: (dollars: string) => `miss ~${dollars}`,
   barWarmOn: 'Keep warm: on',
   barWarmOff: 'Keep warm: off',
   barHandoff: 'Handoff',
@@ -34,6 +45,8 @@ export const TEXT = {
   warmOnUnknown: 'Keep warm on: the first poke waits until a reply shows how long the cache lasts.',
   warmOff: 'Keep warm off.',
   warmIdleOff: (idle: string) => `Keep warm turned itself off after ${idle} without a message from you.`,
+  warmCapped: (pokes: number) =>
+    `Keep warm paused: ${pokes} pokes since your last message cost about as much as one cache write. It goes on once you send a message.`,
 
   // /cache-guard status
   statusLast: (ago: string, tokens: string, model: string) => `Last request ${ago} ago · ~${tokens} tokens · ${model}`,
