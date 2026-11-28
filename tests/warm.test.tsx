@@ -26,10 +26,21 @@ const BAND = {
 
 // Nothing sits beneath the plugin: these hooks stand for the engine.
 // With a seed, the state is answered from it (and does not redraw); without, the kit's own state does.
-async function engine($: Parameters<TestBody>[0], on: On, seed?: Warm, messages: unknown[] = []) {
+async function engine(
+  $: Parameters<TestBody>[0],
+  on: On,
+  seed?: Warm,
+  messages: unknown[] = [],
+  opts: { env?: Record<string, string>; store?: Record<string, unknown> } = {},
+) {
   const clock = mock.clock(on, { now: START })
-  mock.store(on)
-  mock.env(on, {})
+  // the store, readable by the test
+  const store = new Map<string, unknown>(Object.entries(opts.store ?? {}))
+  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_, e) => (store.set(e.key, e.value), { value: undefined }))
+  on('store.delete', (_, e) => (store.delete(e.key), { value: undefined }))
+  on('store.keys', () => ({ value: [...store.keys()] }))
+  mock.env(on, opts.env ?? {})
   let kept = { value: seed as unknown, version: 1 }
   if (seed) {
     on('state.get', (_, e, next) => (e.key === 'warm' ? { value: kept } : next(e)))
@@ -40,13 +51,36 @@ async function engine($: Parameters<TestBody>[0], on: On, seed?: Warm, messages:
     })
   }
   on('command.register', (_, e) => ({ value: { command: e.name } }))
-  on('session.id', () => ({ value: 'session' }))
+  const id = { value: 'session' }
+  on('session.id', () => ({ value: id.value }))
   on('session.messages', () => ({ value: messages }) as never)
   on('session.root', () => ({ value: '/repo' }))
   on('fs.exists', () => ({ value: true }))
-  on('fs.write', () => ({ value: undefined }))
-  on('model.complete', () => ({ value: { isAnswered: true, text: 'ABOUT: Fixing the login test.\n\n## Goal\nfix it', usage: {} } }) as never)
+  const files: Record<string, string> = {}
+  on('fs.write', (_, e) => {
+    files[(e as { path: string }).path] = (e as { text?: string; content?: string }).text ?? (e as { content?: string }).content ?? ''
+    return { value: undefined }
+  })
+  const asked: string[] = []
+  on('model.complete', (_, e) => {
+    asked.push((e as { prompt: string }).prompt)
+    return { value: { isAnswered: true, text: 'ABOUT: Fixing the login test.\n\n## Goal\nfix it', usage: {} } } as never
+  })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  on('prompt.context', (_, e) => ({ blocks: e.blocks }))
+  on('prompt.fill', () => ({ isFilled: false }) as never)
+  on('ui.notify', () => ({ value: undefined }) as never)
+  on('turn.step', async function* (_, e) {
+    return {
+      turnId: e.turnId,
+      index: e.index,
+      answer: 'ok',
+      toolUses: [],
+      stopReason: 'end_turn',
+      usage: { input_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 5, model: 'm' },
+    } as never
+  })
   const ran: string[] = []
   on('command.run', (_, e) => {
     ran.push(`${e.command} ${e.args}`)
@@ -63,8 +97,25 @@ async function engine($: Parameters<TestBody>[0], on: On, seed?: Warm, messages:
     return { text: e.text }
   })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  return { clock, sent, ran, logged, warm: () => kept.value as Warm }
+  return { clock, sent, ran, logged, asked, files, id, store, warm: () => kept.value as Warm }
 }
+
+const ASK = [{ role: 'user', text: 'fix the login test', toolUses: [] }]
+const type = ($: Parameters<TestBody>[0], text: string) => $.prompt.submit({ text, origin: { kind: 'composer' } } as never)
+// what the engine does on /clear: the conversation ends, the process goes on under a new id
+async function clear($: Parameters<TestBody>[0], id: { value: string }, next: string) {
+  await $.session.end({ reason: 'clear', sessionId: id.value, resume: { id: id.value } } as never)
+  id.value = next
+}
+async function step($: Parameters<TestBody>[0]) {
+  const stream = $.turn.step({ turnId: 't', index: 0, model: 'm', messageCount: 1 } as never)
+  for await (const _ of stream) {
+    // read to its end
+  }
+  await stream.result
+}
+const handoffBlock = async ($: Parameters<TestBody>[0]) =>
+  (await $.prompt.context({ blocks: [] } as never)).blocks.find(b => b.name === 'cacheGuardHandoff')?.text
 
 test('the bar is shown by default and its button switches keep warm', async ($, on) => {
   await engine($, on)
@@ -231,4 +282,92 @@ test('the bar shows the context size, its share and the miss cost', async ($, on
   // 310k tokens written at 2x $4 per million
   expect((await ui.find({ type: 'Text', text: /^miss/ }))?.text).toBe(TEXT.barMiss('$2.48'))
   await ui.unmount()
+})
+
+test('a message typed while a handoff is in flight goes to the fresh conversation', async ($, on) => {
+  const { clock, sent, ran, logged, id } = await engine($, on, undefined, ASK)
+
+  await $.command.run(run('handoff'))
+  await type($, 'and update the docs')
+  expect(sent).toEqual([])
+  expect(logged.at(-1)).toBe(TEXT.queuedForHandoff)
+  await clock.advance(5_000)
+  expect(ran).toEqual(['clear '])
+  await clear($, id, 'session-2')
+  await clock.advance(1_000)
+  expect(sent).toEqual(['and update the docs'])
+})
+
+test('a message typed while a handoff is in flight goes back to the box when it is cancelled', async ($, on) => {
+  const { clock, sent, ran, logged } = await engine($, on, undefined, ASK)
+
+  await $.command.run(run('handoff'))
+  await type($, 'and update the docs')
+  expect((await $.command.run(run('cancel'))).text).toBe(TEXT.handoffCancelled)
+  // no prompt box in the test: it is logged instead
+  expect(logged.at(-1)).toBe('and update the docs')
+  await clock.advance(MINUTE)
+  expect(ran).toEqual([])
+  expect(sent).toEqual([])
+})
+
+test('a turn of the old conversation before the clear cancels the handoff', async ($, on) => {
+  const { clock, ran, logged } = await engine($, on, undefined, ASK)
+
+  await $.command.run(run('handoff'))
+  await step($)
+  expect(logged.at(-1)).toBe(TEXT.handoffStale)
+  await clock.advance(MINUTE)
+  expect(ran).toEqual([]) // no /clear
+})
+
+test('a second handoff carries the first one forward', async ($, on) => {
+  const { clock, asked, files, id } = await engine($, on, undefined, ASK)
+
+  await $.command.run(run('handoff'))
+  await clock.advance(5_000)
+  await clear($, id, 'session-2')
+  expect(await handoffBlock($)).toContain('fix it')
+  expect(asked[0]).not.toContain('<earlier_handoff>')
+
+  await clock.advance(MINUTE)
+  expect((await $.command.run(run('handoff'))).text).not.toBe(TEXT.handoffDone)
+  expect(asked[1]).toContain('<earlier_handoff>')
+  expect(asked[1]).toContain('fix it')
+  const notes = Object.entries(files).filter(([path]) => path.endsWith('.md'))
+  expect(notes.length).toBe(2)
+  const first = notes[0]![0].split(/[\\/]/).pop()!
+  expect(notes[1]![1]).toContain(TEXT.fileContinues(first))
+})
+
+test('back in a conversation that was handed off, a new handoff can be written', async ($, on) => {
+  const { clock, id } = await engine($, on, undefined, ASK)
+
+  await $.command.run(run('handoff'))
+  await clock.advance(5_000)
+  await clear($, id, 'session-2')
+  id.value = 'session' // /resume of the old conversation
+  expect((await $.command.run(run('handoff'))).text).not.toBe(TEXT.handoffDone)
+})
+
+test('handoffs of parallel session rows are kept apart in the store', async ($, on) => {
+  const other = { path: '/b.md', about: 'b', text: 'row b handoff', writtenAt: START, host: 'row-b', phase: 'armed' }
+  const { clock, id, store } = await engine($, on, undefined, ASK, { env: { CLAUDE_CODE_HOST_SESSION_ID: 'row-a' }, store: { 'armed:row-b': other } })
+
+  await $.command.run(run('handoff'))
+  expect(((store.get('armed:row-a')) as { phase: string }).phase).toBe('pending')
+  await clock.advance(5_000)
+  await clear($, id, 'session-2')
+  expect(((store.get('armed:row-a')) as { phase: string }).phase).toBe('armed')
+  expect(store.get('armed:row-b')).toEqual(other)
+  expect(store.get('armed')).toBeUndefined()
+})
+
+test('a handoff armed under the old single key comes back for its own row only', async ($, on) => {
+  const legacy = { path: '/a.md', about: 'a', text: 'row a handoff', writtenAt: START, host: 'row-a', phase: 'armed' }
+  const { store } = await engine($, on, undefined, ASK, { env: { CLAUDE_CODE_HOST_SESSION_ID: 'row-a' }, store: { armed: legacy } })
+
+  expect(await handoffBlock($)).toContain('row a handoff')
+  expect(store.get('armed:row-a')).toEqual(legacy)
+  expect(store.get('armed')).toBeUndefined()
 })

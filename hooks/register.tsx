@@ -20,7 +20,10 @@ import { CLEAR_DELAY_S, COMMAND, TEXT } from './texts'
 //    3. /clear is run by the engine ($.command.run) once the command has returned.
 //    4. On that clear the handoff is armed for this process only (module memory, backed by $.store
 //       keyed by the desktop session row); prompt.context adds it to the new conversation's first
-//       message, and a prompt the guard held back is submitted there ($.prompt.submit).
+//       message, and a prompt the guard held back is submitted there ($.prompt.submit). So is one
+//       typed while the handoff was in flight. A turn of the old conversation in that time cancels
+//       the handoff: it no longer says where the work stands.
+//    5. A handoff written in a conversation that itself began from one carries the earlier one forward.
 //
 // C. Keep warm. While on, a short prompt ("poke") goes out shortly before the cache would expire, so a
 //    person coming back finds it warm. A poke reads the cache (0.1x) instead of letting it lapse and
@@ -33,7 +36,8 @@ import { CLEAR_DELAY_S, COMMAND, TEXT } from './texts'
 const MODEL = 'haiku'
 const BUDGET_CHARS = 320_000 // ~80k tokens of condensed transcript for Haiku
 const HEAD_CHARS = 40_000 // kept from the start when trimming: the original ask matters
-const STORE_KEY = 'armed'
+const ARMED_PREFIX = 'armed:' // + the desktop session row: parallel sessions keep their own
+const LEGACY_ARMED_KEY = 'armed' // one key for every session, before 0.6.1
 const LAST_PREFIX = 'last:'
 const MAX_ARMED_AGE_MS = 12 * 60 * 60 * 1000
 const LAST_KEEP_MS = 3 * 24 * 60 * 60 * 1000
@@ -82,6 +86,7 @@ const bar = atom({ plugin: 'cache-guard', key: 'bar' } as const, true)
 const BAR_KEY = 'bar'
 
 type Handoff = { path: string; about: string; text: string; writtenAt: number; host: string; resume?: string }
+type SavedHandoff = Handoff & { phase: 'pending' | 'armed' }
 // `shown` is the model as $.session.model() named it when the request went out, to tell a later switch.
 type LastRequest = { at: number; tokens: number; model: string; shown?: string; effort?: string }
 type Cold = { idleMs: number; ttlS: number; tokens: number; model: string }
@@ -96,6 +101,8 @@ let effortTo: string | null = null // set by /effort <level>, until the next req
 let writtenForConversation: { sessionId: string; path: string } | null = null
 let pending: Handoff | null = null // written, waiting for the /clear
 let armed: Handoff | null = null // handed to the conversation that started after that /clear
+let handoffFor: string | null = null // the conversation whose handoff is being written or waits for its /clear
+let queued: { text: string } | null = null // typed while a handoff was in flight: for the fresh conversation
 let held: { sessionId: string; text: string; at: number; hadAttachments: boolean } | null = null
 let override: { sessionId: string; text: string; until: number } | null = null
 const lastRequest = new Map<string, LastRequest>()
@@ -155,6 +162,8 @@ ABOUT: <one sentence, at most 25 words, saying what the session was last working
 (one concrete action)
 ## Things to be careful of
 (user constraints, traps, anything still running)
+
+If an <earlier_handoff> is given, this conversation began from it: carry forward what still holds (goal, decisions, constraints, what is left), and where the transcript differs, the transcript wins.
 
 Be specific: names, paths, commands, the user's own wording. Leave out sections that would be empty. Under 150 lines. State only what the transcript shows. If the transcript ends with a user message that is not yet answered, the fresh session will receive it as its first message: write the handoff so that message can be acted on, but do not answer it yourself.`
 
@@ -339,6 +348,9 @@ async function pruneStore($: EngineInterface): Promise<void> {
     if (key.startsWith(LAST_PREFIX)) {
       const value = (await $.store.get(key)) as LastRequest | undefined
       if (!value || now - value.at > LAST_KEEP_MS) await $.store.delete(key)
+    } else if (key.startsWith(ARMED_PREFIX) || key === LEGACY_ARMED_KEY) {
+      const value = (await $.store.get(key)) as Partial<SavedHandoff> | undefined
+      if (!value?.writtenAt || now - value.writtenAt > MAX_ARMED_AGE_MS) await $.store.delete(key)
     } else if (key.startsWith(WARM_PREFIX)) {
       const value = (await $.store.get(key)) as Partial<KeptWarm> | undefined
       const at = Math.max(value?.onAt ?? 0, value?.activeAt ?? 0, value?.lastAt ?? 0)
@@ -361,7 +373,16 @@ export const register: Register = on => {
     // A hot reload loses module memory; bring back a handoff armed for this desktop session row.
     try {
       const host = await hostId($)
-      const saved = (await $.store.get(STORE_KEY)) as (Handoff & { phase: 'pending' | 'armed' }) | undefined
+      const key = ARMED_PREFIX + host
+      let saved = (await $.store.get(key)) as SavedHandoff | undefined
+      if (!saved) {
+        const legacy = (await $.store.get(LEGACY_ARMED_KEY)) as SavedHandoff | undefined
+        if (legacy?.host === host) {
+          saved = legacy
+          await $.store.set(key, legacy)
+          await $.store.delete(LEGACY_ARMED_KEY)
+        }
+      }
       const now = await $.clock.now()
       if (saved && saved.host === host && now - saved.writtenAt < MAX_ARMED_AGE_MS) {
         if (saved.phase === 'armed') armed = saved
@@ -415,12 +436,16 @@ export const register: Register = on => {
             await $.store.set(EFFORT_KEEPS_PREFIX + u.model, wasWarm).catch(() => {})
           }
         }
-        // The conversation carried on after its handoff was written (the clear never happened): that
-        // handoff is stale, so a later /clear must not arm it.
-        if (pending && writtenForConversation?.sessionId === sessionId) {
+        // The conversation carried on while its handoff was in flight: the handoff no longer says
+        // where the work stands, so it is cancelled and nothing is cleared.
+        if (handoffFor === sessionId && (await read($, handoffPhase)) !== 'idle') {
+          await cancelHandoff($)
+          $.ui.log(TEXT.handoffStale)
+        } else if (pending && writtenForConversation?.sessionId === sessionId) {
+          // ... or after it, when its /clear never happened: a later /clear must not arm it.
           pending = null
           writtenForConversation = null
-          await $.store.delete(STORE_KEY).catch(() => {})
+          await $.store.delete(await armedKey($)).catch(() => {})
         }
       }
     } catch {
@@ -448,6 +473,12 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     if (e.command || e.isMeta || e.turnId !== undefined) return next(e)
     if (!GUARDED_ORIGINS.has(e.origin.kind)) return next(e)
+    // A handoff in flight: the message belongs to the fresh conversation, not to this one.
+    if ((await read($, handoffPhase)) !== 'idle') {
+      queued = { text: queued ? `${queued.text}\n\n${e.text}` : e.text }
+      $.ui.log(TEXT.queuedForHandoff)
+      return { drop: TEXT.queuedDrop }
+    }
     if ((await $.env.get('CACHE_GUARD_DISABLE')) === '1') return next(e)
 
     const sessionId = await $.session.id()
@@ -521,19 +552,22 @@ export const register: Register = on => {
 
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear' && pending) {
-      armed = pending
+      armed = queued ? { ...pending, resume: [pending.resume, queued.text].filter(Boolean).join('\n\n') } : pending
       pending = null
-      await $.store.set(STORE_KEY, { ...armed, phase: 'armed' }).catch(() => {})
+      queued = null
+      handoffFor = null
+      await $.store.set(await armedKey($), { ...armed, phase: 'armed' }).catch(() => {})
       const h = armed
       $.clock.after(400, () => {
         void announce($, h)
       })
-    } else if (e.reason === 'clear' && armed) {
-      // A later /clear: the handoff belonged to the conversation that just ended.
+    } else if ((e.reason === 'clear' || e.reason === 'resume') && armed) {
+      // A later /clear, or a switch to another conversation: the handoff belonged to the one that ended.
       armed = null
-      await $.store.delete(STORE_KEY).catch(() => {})
+      await $.store.delete(await armedKey($)).catch(() => {})
     }
     if (e.reason === 'clear') {
+      writtenForConversation = null // a /resume back into the old conversation may hand off again
       await setWarm($, w => ({ ...w, lastAt: 0 })).catch(() => {})
       lastRequest.delete(e.sessionId)
       await $.store.delete(LAST_PREFIX + e.sessionId).catch(() => {})
@@ -639,6 +673,8 @@ async function handoff($: EngineInterface): Promise<{ text: string }> {
 
   const myStop = new AbortController()
   stop = myStop
+  handoffFor = sessionId
+  const earlier = armed // this conversation began from it
   await update($, handoffPhase, () => 'writing' as HandoffPhase)
   let isClearing = false
   try {
@@ -648,7 +684,8 @@ async function handoff($: EngineInterface): Promise<{ text: string }> {
     const resume = held?.sessionId === sessionId ? held : null
     const root = await $.session.root()
     const condensed = condense(messages, resume?.text)
-    const ask = `Working directory: ${root}\n\n<transcript>\n${condensed}\n</transcript>`
+    const before = earlier ? `<earlier_handoff>\n${earlier.text}\n</earlier_handoff>\n\n` : ''
+    const ask = `Working directory: ${root}\n\n${before}<transcript>\n${condensed}\n</transcript>`
 
     let about = ''
     let body = ''
@@ -672,7 +709,8 @@ async function handoff($: EngineInterface): Promise<{ text: string }> {
     const now = await $.clock.now()
     const dir = `${root.replace(/[\\/]+$/, '')}/.claude/handoffs`
     const path = `${dir}/${stamp(now)}.md`
-    const text = `${TEXT.fileTitle}\n\n${note}\n\n${TEXT.fileAbout(about)}\n\n${body}\n`
+    const chain = earlier ? `${TEXT.fileContinues(earlier.path.split(/[\\/]/).pop() ?? earlier.path)}\n\n` : ''
+    const text = `${TEXT.fileTitle}\n\n${note}\n\n${chain}${TEXT.fileAbout(about)}\n\n${body}\n`
     if (!(await $.fs.exists(`${dir}/.gitignore`))) await $.fs.write(`${dir}/.gitignore`, '*\n')
     await $.fs.write(path, text)
     if (myStop.signal.aborted) return { text: '' } // cancelHandoff says so
@@ -682,7 +720,7 @@ async function handoff($: EngineInterface): Promise<{ text: string }> {
     heldBeforeHandoff = held
     held = null
     override = null
-    await $.store.set(STORE_KEY, { ...pending, phase: 'pending' })
+    await $.store.set(await armedKey($), { ...pending, phase: 'pending' })
 
     // Run /clear after a short grace period, in which Cancel handoff still stops it. Calling it from
     // inside this hook would be refused anyway (the command is still running).
@@ -699,9 +737,13 @@ async function handoff($: EngineInterface): Promise<{ text: string }> {
   } catch (err) {
     return { text: TEXT.handoffFailed(err instanceof Error ? err.message : String(err)) }
   } finally {
-    if (!isClearing) {
-      if (stop === myStop) stop = null
+    // Failed or empty: nothing clears, so a message typed meanwhile goes back to the prompt box.
+    // (Cancelled: cancelHandoff has done all this already.)
+    if (!isClearing && stop === myStop) {
+      stop = null
+      handoffFor = null
       await update($, handoffPhase, () => 'idle' as HandoffPhase).catch(() => {})
+      await giveBackQueued($)
     }
     $.ui.status(undefined)
   }
@@ -722,11 +764,27 @@ async function cancelHandoff($: EngineInterface): Promise<string> {
     held = heldBeforeHandoff
     heldBeforeHandoff = null
     if (held) override = { sessionId: held.sessionId, text: held.text, until: (await $.clock.now()) + CONFIRM_MS }
-    await $.store.delete(STORE_KEY).catch(() => {})
+    await $.store.delete(await armedKey($)).catch(() => {})
   }
+  handoffFor = null
   await update($, handoffPhase, () => 'idle' as HandoffPhase)
   $.ui.status(undefined)
+  await giveBackQueued($)
   return TEXT.handoffCancelled
+}
+
+// A message typed while a handoff was in flight that will not reach a fresh conversation: back into
+// the prompt box, or into the log where there is none.
+async function giveBackQueued($: EngineInterface): Promise<void> {
+  if (!queued) return
+  const { text } = queued
+  queued = null
+  const filled = await $.prompt.fill({ text }).catch(() => undefined)
+  if (!filled?.isFilled) $.ui.log(text)
+}
+
+async function armedKey($: EngineInterface): Promise<string> {
+  return ARMED_PREFIX + (await hostId($))
 }
 
 // Keep warm as kept in $.store, under the desktop session row (else the session id): $.state is the

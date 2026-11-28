@@ -31,11 +31,11 @@ The countdown is green while more than half the cache's lifetime is left, yellow
 **`/cache-guard handoff`.** Runs in the engine, never as a model turn of the current conversation:
 
 1. Reads the transcript as data, condenses it, and has Haiku write a handoff (goal, decisions, state, files, what is left, next step) to `<project>/.claude/handoffs/<timestamp>.md` (git-ignored).
-2. Runs `/clear` by itself, 5 seconds later. Until then the bar's **Cancel handoff** button, or `/cache-guard cancel`, stops it: while the summary is being written, or during those 5 seconds. Nothing is cleared and a held prompt stays held.
-3. Gives the fresh conversation the handoff, and sends the prompt the guard held back, so work continues immediately.
+2. Runs `/clear` by itself, 5 seconds later. Until then the bar's **Cancel handoff** button, or `/cache-guard cancel`, stops it: while the summary is being written, or during those 5 seconds. Nothing is cleared, a held prompt stays held, and a message typed meanwhile goes back into the prompt box. A turn of the old conversation in that time (a notification, say) cancels it the same way, since the handoff no longer says where the work stands.
+3. Gives the fresh conversation the handoff, and sends the prompt the guard held back, plus any message typed while the handoff was in flight, so work continues immediately.
 4. Shows "↻ Continued: <one sentence>" and a desktop notification.
 
-The handoff is tied to the session row it was written in: parallel sessions in the same project never pick up each other's handoffs.
+Handoffs chain: a handoff written in a conversation that began from one carries the earlier one forward, and its file names the file it continues. Each handoff is tied to the session row it was written in: parallel sessions in the same project never pick up or overwrite each other's handoffs.
 
 **`/cache-guard`** alone, or `/cache-guard status`, shows what the guard sees; `simulate-cold` makes the current conversation count as cold, for testing.
 
